@@ -1,0 +1,7 @@
+input
+
+.env
+.DS_Store
+.idea
+results
+node_modules

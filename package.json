@@ -1,0 +1,24 @@
+{
+  "name": "lm-tiny-prompt-evaluation-framework",
+  "version": "1.0.0",
+  "description": "Tiny framework for testing different prompt versions with large language models",
+  "main": "src/evaluator.js",
+  "type": "module",
+  "scripts": {
+    "test": "node src/framework.js",
+    "test-connection": "node utils/test-connection.js",
+    "correlations": "node utils/correlation-viewer.js"
+  },
+  "keywords": [
+    "llm",
+    "prompt-analysis",
+    "prompt-testing",
+    "ai-models"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^16.5.0",
+    "node-fetch": "^2.7.0"
+  }
+}
