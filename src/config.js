@@ -14,7 +14,7 @@ const DEFAULT_CONFIGURATION = {
   },
   models: {
     default: ['phi-3.1-mini-128k-instruct'],
-    max_tokens: 4000,
+    max_tokens: 30000,
     temperature: 0.7,
     top_p: 0.95,
   },
@@ -22,6 +22,7 @@ const DEFAULT_CONFIGURATION = {
     data: path.join(__dirname, '..', 'input', 'data'),
     prompts: path.join(__dirname, '..', 'input', 'prompts', 'txt'),
     schemas: path.join(__dirname, '..', 'input', 'schemas'),
+    evaluators: path.join(__dirname, '..', 'input', 'evaluators'),
     results: path.join(__dirname, '..', 'results'),
   },
 };
@@ -50,6 +51,9 @@ export const CONFIGURATION = {
     schemas: process.env.INPUT_SCHEMAS_DIR ? 
       path.resolve(process.env.INPUT_SCHEMAS_DIR) : 
       DEFAULT_CONFIGURATION.directories.schemas,
+    evaluators: process.env.INPUT_EVALUATORS_DIR ? 
+      path.resolve(process.env.INPUT_EVALUATORS_DIR) : 
+      DEFAULT_CONFIGURATION.directories.evaluators,
   },
   performance: {
     concurrencyLimit: parseInt(process.env.CONCURRENCY_LIMIT || '3', 10),

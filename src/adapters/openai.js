@@ -1,11 +1,12 @@
 
+import axios from 'axios';
+
 export default class OpenAIAdapter {
   constructor(config = {}) {
     this.baseUrl = config.baseUrl || 'http://127.0.0.1:1234';
     this.model = normalizeModelId(config.model);
     this.temperature = config.temperature || 0.7;
-    this.max_tokens = config.max_tokens || 2048;
-    this.timeout = parseInt(process.env.REQUEST_TIMEOUT_MS || '120000', 10);
+    this.timeout = parseInt(process.env.REQUEST_TIMEOUT_MS || '900000', 10);
 
     console.log(`OpenAIAdapter initialized with model: ${this.model}, max_tokens: ${this.max_tokens}`);
   }
@@ -66,11 +67,24 @@ export default class OpenAIAdapter {
         normalizeModelId(options.model) :
       this.model;
 
+    // Calculate total input tokens (approximate)
+    let inputTokenCount = 0;
+    messages.forEach(msg => {
+      // Rough estimate: 1 token ≈ 4 characters for English text
+      inputTokenCount += Math.ceil((msg.content?.length || 0) / 4);
+    });
+    
+    const defaultMaxTokens = options.max_tokens || this.max_tokens;
+    const safeMaxTokens = Math.max(defaultMaxTokens, 32000 - inputTokenCount);
+    
+    console.log(`Estimated input tokens: ~${inputTokenCount}`);
+    console.log(`Adjusted max_tokens to: ${safeMaxTokens} (from ${defaultMaxTokens})`);
+
     const requestBody = {
       model: modelToUse,
       messages,
       temperature: options.temperature || this.temperature,
-      max_tokens: options.max_tokens || this.max_tokens,
+      max_tokens: safeMaxTokens,
       top_p: options.top_p || 0.95,
     };
     
@@ -85,36 +99,42 @@ export default class OpenAIAdapter {
       };
     }
     
-    // Create an AbortController for timeout
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), this.timeout);
     console.log(`Request timeout set to ${this.timeout}ms`);
     
     try {
       // Start timing the request
       const startTime = Date.now();
       
-      const response = await fetch(endpoint, {
-        method: 'POST',
+      // Configure axios for large responses
+      const response = await axios({
+        method: 'post',
+        url: endpoint,
+        data: requestBody,
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify(requestBody),
-        signal: controller.signal
+        timeout: this.timeout,
+        maxContentLength: Infinity,
+        maxBodyLength: Infinity
       });
       
       // End timing the request
       const endTime = Date.now();
       const completionTime = endTime - startTime;
       
-      clearTimeout(timeoutId);
+      // Axios automatically parses JSON responses
+      const responseData = response.data;
       
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(`API request failed with status ${response.status}: ${JSON.stringify(errorData)}`);
+      // Log response details for debugging
+      if (responseData.choices && responseData.choices[0] && responseData.choices[0].message) {
+        const contentLength = responseData.choices[0].message.content?.length || 0;
+        console.log(`Response content length: ${contentLength} characters`);
+        
+        // Check for potentially truncated responses
+        if (contentLength > 0 && responseData.choices[0].finish_reason === 'length') {
+          console.warn('Warning: Response may be truncated (finish_reason=length)');
+        }
       }
-
-      const responseData = await response.json();
       
       if (!responseData.usage) {
         responseData.usage = {
@@ -124,12 +144,25 @@ export default class OpenAIAdapter {
       
       return responseData;
     } catch (error) {
-      clearTimeout(timeoutId);
-      if (error.name === 'AbortError') {
+      if (error.code === 'ECONNABORTED') {
         throw new Error(`Request timed out after ${this.timeout}ms`);
       }
-      console.error('Error executing chat with model:', error);
-      throw error;
+      
+      // Enhanced error reporting
+      if (error.response) {
+        // The request was made and the server responded with a status code
+        console.error('Error response data:', error.response.data);
+        console.error('Error response status:', error.response.status);
+        throw new Error(`API request failed with status ${error.response.status}: ${JSON.stringify(error.response.data)}`);
+      } else if (error.request) {
+        // The request was made but no response was received
+        console.error('No response received:', error.request);
+        throw new Error(`No response received from server: ${error.message}`);
+      } else {
+        // Something happened in setting up the request
+        console.error('Error setting up request:', error.message);
+        throw error;
+      }
     }
   }
   
@@ -145,33 +178,29 @@ export default class OpenAIAdapter {
    */
   async listModels() {
     const endpoint = `${this.baseUrl}/v1/models`;
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), this.timeout);
     
     try {
-      const response = await fetch(endpoint, {
-        method: 'GET',
+      const response = await axios({
+        method: 'get',
+        url: endpoint,
         headers: {
           'Content-Type': 'application/json',
         },
-        signal: controller.signal
+        timeout: this.timeout
       });
       
-      clearTimeout(timeoutId);
-      
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(`API request failed with status ${response.status}: ${JSON.stringify(errorData)}`);
-      }
-
-      return response.json();
+      return response.data;
     } catch (error) {
-      clearTimeout(timeoutId);
-      if (error.name === 'AbortError') {
+      if (error.code === 'ECONNABORTED') {
         throw new Error(`Request timed out after ${this.timeout}ms`);
       }
-      console.error('Error listing models:', error);
-      throw error;
+      
+      if (error.response) {
+        throw new Error(`API request failed with status ${error.response.status}: ${JSON.stringify(error.response.data)}`);
+      } else {
+        console.error('Error listing models:', error);
+        throw error;
+      }
     }
   }
 }

@@ -221,6 +221,7 @@ USE_STRUCTURED_OUTPUT_SCHEMA=true
 INPUT_PROMPTS_DIR=input/prompts
 INPUT_SCHEMAS_DIR=input/schemas
 INPUT_DATA_DIR=input/data
+INPUT_EVALUATORS_DIR=input/evaluators
 RESULTS_DIR=results
 
 # Request Configuration

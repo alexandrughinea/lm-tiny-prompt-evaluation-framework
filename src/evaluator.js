@@ -1,12 +1,6 @@
 import fs from 'fs/promises';
 import path from 'path';
-import {fileURLToPath} from 'url';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// Path to custom evaluators
-const EVALUATORS_DIR = path.join(__dirname, '..', 'input', 'evaluators');
+import { CONFIGURATION } from './config.js';
 
 /**
  * Loads a custom evaluator if available
@@ -16,7 +10,7 @@ const EVALUATORS_DIR = path.join(__dirname, '..', 'input', 'evaluators');
  */
 async function loadCustomEvaluator(type) {
   try {
-    const evaluatorPath = path.join(EVALUATORS_DIR, `${type}.js`);
+    const evaluatorPath = path.join(CONFIGURATION.directories.evaluators, `${type}.js`);
     
     // Check if the file exists
     try {
@@ -75,9 +69,26 @@ export async function evaluate(result, options = {}) {
   const customQualitative = await loadCustomEvaluator('qualitative');
   
   // Use custom evaluators if available, otherwise use default
-  const quantitative = customQuantitative ? 
+  let quantitative = customQuantitative ? 
     customQuantitative(parsedResult, options) : 
     quantitativeEvaluation(parsedResult, options);
+    
+  // Ensure all required metrics are present and sensible
+  quantitative = {
+    accuracy: parseFloat(quantitative.accuracy || 0),
+    completeness: parseFloat(quantitative.completeness || 0),
+    relevance: parseFloat(quantitative.relevance || 0),
+    overall: parseFloat(quantitative.overall || 0),
+    errors: quantitative.errors || []
+  };
+  
+  // If overall score is 0 but completeness is high, recalculate using the default formula
+  if (quantitative.overall === 0 && quantitative.completeness > 0) {
+    // Use default formula as fallback
+    const calculatedAccuracy = (quantitative.completeness + quantitative.relevance) / 2;
+    quantitative.accuracy = calculatedAccuracy;
+    quantitative.overall = (calculatedAccuracy * 0.4) + (quantitative.completeness * 0.4) + (quantitative.relevance * 0.2);
+  }
     
   const qualitative = customQualitative ? 
     customQualitative(parsedResult, options) : 

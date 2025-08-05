@@ -660,7 +660,7 @@ async function exportCsvByModel(results, timestamp, runDir) {
         const dataMap = getCSVDataMap(result);
 
         // Use the same header fields order to build the row
-        const rowValues = getCSVColumns().map(field => dataMap[field]);
+        const rowValues = getCSVColumns().map(field => escapeCSV(dataMap[field]));
         csvContent += rowValues.join(CSV_FORMAT.COMMA).concat(CSV_FORMAT.NEW_LINE);
       }
 
