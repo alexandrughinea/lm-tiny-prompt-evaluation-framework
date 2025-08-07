@@ -7,6 +7,7 @@ import OpenAIAdapter from './adapters/openai.js';
 import {ensureDir} from '../utils/file-utils.js';
 import {CSV_FORMAT, escapeCSV, getCSVColumns, getCSVColumnsJoined, getCSVDataMap} from '../utils/csv-utils.js';
 import {generateCacheKey, getFromCache, saveToCache} from '../utils/cache-utils.js';
+import { sendTestResultsToSlack, sendErrorToSlack } from '../utils/slack.js';
 
 
 /**
@@ -765,7 +766,6 @@ async function runTests() {
         let input_system_prompt = null;
         let input_assistant_prompt = null;
 
-        // Clear visual separator for test results
         console.log(`\n${'─'.repeat(50)}`);
         console.log(`✅ TEST ${testId} - COMPLETED in ${response.usage?.completion_ms || 'unknown'} ms`);
         console.log(`📊 Scores:`);
@@ -949,19 +949,16 @@ async function runTests() {
     results.push(...allResults.filter(result => result !== null));
 
     if (results.length > 0) {
-      await saveResults(results);
+      const saveInfo = await saveResults(results);
       
-      // Generate and display test summary
       console.log(`\n${'='.repeat(60)}`);
       console.log(`📊 TEST EXECUTION SUMMARY`);
       console.log(`${'='.repeat(60)}`);
       
-      // Count successful and failed tests
       const totalTests = testCases.length;
       const successfulTests = results.length;
       const failedTests = totalTests - successfulTests;
       
-      // Calculate average scores
       const avgScores = {
         overall: 0,
         accuracy: 0,
@@ -980,7 +977,6 @@ async function runTests() {
         avgScores[key] = (avgScores[key] / successfulTests).toFixed(CSV_FORMAT.FRACTION_DIGITS);
       });
       
-      // Display summary statistics
       console.log(`📊 Test Statistics:`);
       console.log(`  • Total Tests: ${totalTests}`);
       console.log(`  • Successful: ${successfulTests} (${Math.round(successfulTests/totalTests*100)}%)`);
@@ -994,16 +990,48 @@ async function runTests() {
       
       console.log(`\n✅ Tests completed successfully!`);
       console.log(`${'='.repeat(60)}`);
+      
+      try {
+        const runDir = saveInfo.runDir;
+        const files = await fs.readdir(runDir);
+        let csvContent = '';
+        
+        const csvFile = files.find(file => file.endsWith('.csv'));
+        if (csvFile) {
+          const csvPath = path.join(runDir, csvFile);
+          try {
+            csvContent = await fs.readFile(csvPath, 'utf8');
+            console.log(`Found CSV file for Slack webhook: ${csvPath}`);
+          } catch (err) {
+            console.warn(`Could not read CSV file ${csvPath} for Slack webhook:`, err.message);
+          }
+        }
+        
+        const testSummary = {
+          totalTests,
+          successful: successfulTests,
+          failed: failedTests,
+          averageScores: {
+            overall: parseFloat(avgScores.overall),
+            accuracy: parseFloat(avgScores.accuracy),
+            completeness: parseFloat(avgScores.completeness),
+            relevance: parseFloat(avgScores.relevance)
+          }
+        };
+        
+        console.log('Sending test results to Slack...');
+        await sendTestResultsToSlack(testSummary, csvContent);
+      } catch (slackError) {
+        console.error('Error sending test results to Slack:', slackError);
+      }
     } else {
       console.error('\n❌ No test results were generated.');
     }
   } catch (error) {
-    // Format the main error message for better readability
     console.log(`\n${'='.repeat(60)}`);
     console.log(`❌ TEST EXECUTION FAILED`);
     console.log(`${'='.repeat(60)}`);
     
-    // Extract the most useful part of the error message
     let errorMessage = 'Unknown error';
     if (error.cause && error.cause.code) {
       errorMessage = `${error.cause.code}`;
@@ -1014,7 +1042,6 @@ async function runTests() {
     console.log(`🚨 Error details:`);
     console.log(`  • Error: ${errorMessage}`);
     
-    // Provide troubleshooting guidance based on common errors
     if (errorMessage.includes('ECONNREFUSED') || errorMessage.includes('ETIMEDOUT')) {
       console.log(`\n🔧 Troubleshooting suggestions:`);
       console.log(`  • Check if the model server is running at ${CONFIGURATION.modelServer.url}`);
@@ -1028,6 +1055,19 @@ async function runTests() {
     }
     
     console.log(`${'='.repeat(60)}`);
+    
+    try {
+      const context = {
+        status: 'failed',
+        task_type: 'test_execution',
+        models: CONFIGURATION.models.default.join(','),
+        error_type: error.cause?.code || 'runtime_error'
+      };
+      console.log('Sending error notification to Slack...');
+      await sendErrorToSlack(context, error);
+    } catch (slackError) {
+      console.error('Failed to send error notification to Slack:', slackError);
+    }
   }
 }
 

@@ -57,7 +57,6 @@ export const CONFIGURATION = {
   },
   performance: {
     concurrencyLimit: parseInt(process.env.CONCURRENCY_LIMIT || '3', 10),
-    // Enable caching to avoid re-evaluating identical combinations
     caching: {
       enabled: process.env.ENABLE_RESPONSE_CACHING === 'true',
       directory: process.env.CACHE_DIR || path.join(__dirname, '..', 'cache')
