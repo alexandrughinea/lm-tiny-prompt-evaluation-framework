@@ -7,6 +7,16 @@ export default class OpenAIAdapter {
     this.model = normalizeModelId(config.model);
     this.temperature = config.temperature || 0.7;
     this.timeout = parseInt(process.env.REQUEST_TIMEOUT_MS || '900000', 10);
+    
+    this.authUsername = process.env.AUTH_USERNAME;
+    this.authPassword = process.env.AUTH_PASSWORD;
+    this.authHeader = null;
+    
+    if (this.authUsername && this.authPassword) {
+      const credentials = Buffer.from(`${this.authUsername}:${this.authPassword}`).toString('base64');
+      this.authHeader = `Basic ${credentials}`;
+      console.log('OpenAIAdapter initialized with basic authentication');
+    }
 
     console.log(`OpenAIAdapter initialized with model: ${this.model}, max_tokens: ${this.max_tokens}`);
   }
@@ -106,13 +116,19 @@ export default class OpenAIAdapter {
       const startTime = Date.now();
       
       // Configure axios for large responses
+      const headers = {
+        'Content-Type': 'application/json',
+      };
+      
+      if (this.authHeader) {
+        headers['Authorization'] = this.authHeader;
+      }
+      
       const response = await axios({
         method: 'post',
         url: endpoint,
         data: requestBody,
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers,
         timeout: this.timeout,
         maxContentLength: Infinity,
         maxBodyLength: Infinity
@@ -180,12 +196,19 @@ export default class OpenAIAdapter {
     const endpoint = `${this.baseUrl}/v1/models`;
     
     try {
+      const headers = {
+        'Content-Type': 'application/json',
+      };
+      
+      // Add authentication header if available
+      if (this.authHeader) {
+        headers['Authorization'] = this.authHeader;
+      }
+      
       const response = await axios({
         method: 'get',
         url: endpoint,
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers,
         timeout: this.timeout
       });
       

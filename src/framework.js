@@ -98,16 +98,11 @@ async function loadData() {
  */
 async function getAvailableModels() {
   try {
-    const response = await fetch(`${CONFIGURATION.modelServer.url}/v1/models`, {
-      method: 'GET',
-      headers: { 'Content-Type': 'application/json' }
+    const adapter = new OpenAIAdapter({
+      baseUrl: CONFIGURATION.modelServer.url
     });
-
-    if (!response.ok) {
-      throw new Error(`Models endpoint returned status ${response.status}: ${response.statusText}`);
-    }
-
-    const data = await response.json();
+    
+    const data = await adapter.listModels();
     return data.data?.map(model => model.id) || [];
   } catch (error) {
     console.error('Error getting available models:', error);
