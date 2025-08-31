@@ -2,10 +2,9 @@ import fs from 'fs/promises';
 import path from 'path';
 import {evaluate} from './evaluator.js';
 import {CONFIGURATION} from './config.js';
-import fetch from 'node-fetch';
 import OpenAIAdapter from './adapters/openai.js';
 import {ensureDir} from '../utils/file-utils.js';
-import {CSV_FORMAT, escapeCSV, getCSVColumns, getCSVColumnsJoined, getCSVDataMap} from '../utils/csv-utils.js';
+import {CSV_FORMAT, escapeCSV, getCSVColumns, getCSVColumnsJoined, getCSVDataMap, formatProcessingTime} from '../utils/csv-utils.js';
 import {generateCacheKey, getFromCache, saveToCache} from '../utils/cache-utils.js';
 import { sendTestResultsToSlack, sendErrorToSlack } from '../utils/slack.js';
 
@@ -412,12 +411,13 @@ function generateReport(results) {
 
   // Summary table
   report += `## Summary\n\n`;
-  report += `| Model | Prompt | Document | Overall Score | Accuracy | Completeness | Relevance |\n`;
-  report += `|-------|--------|----------|--------------|----------|--------------|-----------|\n`;
+  report += `| Model | Prompt | Document | Overall Score | Accuracy | Completeness | Relevance | Processing Time |\n`;
+  report += `|-------|--------|----------|--------------|----------|--------------|-----------|-----------------|\n`;
 
   for (const result of results) {
-    const { model, input_user_prompt, input_data_file, quantitative } = result;
-    report += `| ${model} | ${input_user_prompt} | ${input_data_file} | ${quantitative.overall.toFixed(2)} | ${quantitative.accuracy.toFixed(2)} | ${quantitative.completeness.toFixed(2)} | ${quantitative.relevance.toFixed(2)} |\n`;
+    const { model, input_user_prompt, input_data_file, quantitative, processing_time } = result;
+    const formattedTime = processing_time ? `${(processing_time / 1000).toFixed(1)}s` : 'N/A';
+    report += `| ${model} | ${input_user_prompt} | ${input_data_file} | ${quantitative.overall.toFixed(2)} | ${quantitative.accuracy.toFixed(2)} | ${quantitative.completeness.toFixed(2)} | ${quantitative.relevance.toFixed(2)} | ${formattedTime} |\n`;
   }
 
   // Model comparison
@@ -742,6 +742,9 @@ async function runTests() {
       console.log(`  • File: ${input_data_file}`);
       console.log(`${'─'.repeat(50)}`);
 
+      // Start timing the entire test case processing
+      const testStartTime = Date.now();
+
       try {
         console.log(`⏳ Executing prompt...`);
         const response = await executePrompt(model, promptContent, documentContent, input_user_prompt, prompts);
@@ -761,8 +764,13 @@ async function runTests() {
         let input_system_prompt = null;
         let input_assistant_prompt = null;
 
+        // Calculate total processing time
+        const testEndTime = Date.now();
+        const processingTimeMs = testEndTime - testStartTime;
+        const formattedProcessingTime = formatProcessingTime(processingTimeMs);
+
         console.log(`\n${'─'.repeat(50)}`);
-        console.log(`✅ TEST ${testId} - COMPLETED in ${response.usage?.completion_ms || 'unknown'} ms`);
+        console.log(`✅ TEST ${testId} - COMPLETED in ${formattedProcessingTime}`);
         console.log(`📊 Scores:`);
         console.log(`  • Overall: ${quantitative.overall.toFixed(CSV_FORMAT.FRACTION_DIGITS)}`);
         console.log(`  • Accuracy: ${quantitative.accuracy.toFixed(CSV_FORMAT.FRACTION_DIGITS)}`);
@@ -809,6 +817,7 @@ async function runTests() {
           quantitative,
           qualitative,
           response: parsedResponse,
+          processing_time: formattedProcessingTime
         };
 
         // Write individual result to disk immediately
@@ -879,13 +888,14 @@ async function runTests() {
     }
 
     // Process test cases for a single model in parallel with concurrency limit
-    const processModelTestCases = async (modelTestCases, limit) => {
+    const processModelTestCases = async (modelTestCases, limit, globalTestCounter) => {
       const results = [];
       const inProgress = new Set();
 
       for (let i = 0; i < modelTestCases.length; i++) {
         const testCase = modelTestCases[i];
-        const testId = `${i + 1}/${modelTestCases.length}`;
+        const testId = `${globalTestCounter.current}/${testCases.length}`;
+        globalTestCounter.current++;
         // Wait if we've reached the concurrency limit
         while (inProgress.size >= limit) {
           await Promise.race(inProgress);
@@ -916,6 +926,7 @@ async function runTests() {
     const allResults = [];
     const modelEntries = Object.entries(testCasesByModel);
     const totalModels = modelEntries.length;
+    const globalTestCounter = { current: 1 }; // Track global test progress
     
     console.log(`\n${'='.repeat(60)}`);
     console.log(`🔍 STARTING TEST EXECUTION - ${testCases.length} total test cases across ${totalModels} models`);
@@ -932,7 +943,7 @@ async function runTests() {
       console.log(`${'─'.repeat(60)}`);
       
       const startTime = Date.now();
-      const modelResults = await processModelTestCases(modelTestCases, concurrencyLimit);
+      const modelResults = await processModelTestCases(modelTestCases, concurrencyLimit, globalTestCounter);
       const elapsedTime = ((Date.now() - startTime) / 1000 / 60).toFixed(2);
       
       console.log(`\n✅ Model ${model} completed in ${elapsedTime} minutes`);

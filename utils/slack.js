@@ -2,6 +2,8 @@
  * Slack webhook integration for sending test results with modern formatting
  */
 
+import axios from 'axios';
+
 /**
  * @typedef {Object} SlackWebhookPayload
  * @property {Array<{
@@ -169,21 +171,19 @@ export async function sendErrorToSlack(context = {}, error) {
   };
 
   try {
-    const response = await fetch(slackWebhookUrl, {
-      method: "POST",
+    const response = await axios.post(slackWebhookUrl, payload, {
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify(payload),
     });
 
-    if (!response.ok) {
+    if (response.status >= 200 && response.status < 300) {
+      console.log("Error notification sent to Slack successfully");
+    } else {
       console.error("Failed to send error to Slack", {
         status: response.status,
         statusText: response.statusText,
       });
-    } else {
-      console.log("Error notification sent to Slack successfully");
     }
   } catch (err) {
     console.error("Error sending to Slack", { error: err });
@@ -337,25 +337,22 @@ export async function sendTestResultsToSlack(summary, csvContent) {
   );
 
   try {
-    const response = await fetch(slackWebhookUrl, {
-      method: "POST",
+    const response = await axios.post(slackWebhookUrl, payload, {
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify(payload),
     });
 
-    if (!response.ok) {
+    if (response.status >= 200 && response.status < 300) {
+      console.log("Test results sent to Slack successfully");
+    } else {
       console.error("Failed to send test results to Slack", {
         status: response.status,
         statusText: response.statusText,
       });
-    } else {
-      console.log("Test results sent to Slack successfully");
     }
   } catch (err) {
     console.error("Error sending test results to Slack", { error: err });
   }
 }
-
 

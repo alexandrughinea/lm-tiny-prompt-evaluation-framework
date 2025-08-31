@@ -35,7 +35,9 @@ export function getCSVColumns() {
         // Qualitative metrics
         'strengths_count',
         'weaknesses_count',
-        'suggestions_count'
+        'suggestions_count',
+        // Performance metrics
+        'processing_time'
     ];
 }
 
@@ -48,7 +50,8 @@ export function getCSVDataMap({
                                   input_system_prompt,
                                   input_assistant_prompt,
                                   quantitative,
-                                  qualitative
+                                  qualitative,
+                                  processing_time
                               }) {
 
     const overallScore = quantitative.overall.toFixed(CSV_FORMAT.FRACTION_DIGITS) || CSV_FORMAT.NA;
@@ -74,6 +77,8 @@ export function getCSVDataMap({
         strengths_count: qualitative.strengths?.length || 0,
         weaknesses_count: qualitative.weaknesses?.length || 0,
         suggestions_count: qualitative.suggestions?.length || 0,
+        // Performance metrics
+        processing_time: processing_time || CSV_FORMAT.NA
     };
 }
 
@@ -101,4 +106,26 @@ export function escapeCSV(text) {
         }
     }
     return text;
+}
+
+/**
+ * Format processing time in minutes and seconds
+ * 
+ * @param {number} milliseconds - Time in milliseconds
+ * @returns {string} - Formatted time string (e.g., "2m 30s")
+ */
+export function formatProcessingTime(milliseconds) {
+    if (!milliseconds || milliseconds < 0) {
+        return CSV_FORMAT.NA;
+    }
+    
+    const totalSeconds = Math.round(milliseconds / 1000);
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    
+    if (minutes > 0) {
+        return `${minutes}m ${seconds}s`;
+    } else {
+        return `${seconds}s`;
+    }
 }
