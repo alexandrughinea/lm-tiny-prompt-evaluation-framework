@@ -1,0 +1,7 @@
+{
+  "bucket": "multiple_cats",
+  "domestic_cat": true,
+  "person": false,
+  "wildlife_felid": false,
+  "contains_manmade_object": false
+}

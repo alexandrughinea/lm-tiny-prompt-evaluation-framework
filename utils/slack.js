@@ -28,8 +28,9 @@ import axios from 'axios';
  * }>} blocks - Message blocks for Slack API
  */
 
-// Maximum Slack message payload size (30KB)
-const MAX_PAYLOAD_SIZE = 30 * 1024;
+// Slack has a 40,000 character limit - use much safer limits
+const MAX_PAYLOAD_SIZE = 35 * 1024; // 35KB total (safe margin from 40K limit)
+const MAX_CSV_PREVIEW_SIZE = 3 * 1024; // Reserve only 3KB for CSV preview
 
 // Using direct console.warn instead of custom function
 
@@ -42,27 +43,38 @@ const MAX_PAYLOAD_SIZE = 30 * 1024;
 function createCsvPreview(csvContent) {
   const header = '```\n'; // code block start
   const footer = '\n```'; // code block end
-  const maxCsvLength = MAX_PAYLOAD_SIZE - Buffer.byteLength(header + footer, 'utf8');
-  let preview = csvContent;
-  const buffer = Buffer.from(preview, 'utf8');
+  const truncationNote = '\n... [truncated]';
+  const maxCsvLength = MAX_CSV_PREVIEW_SIZE - Buffer.byteLength(header + footer + truncationNote, 'utf8');
+  
+  const lines = csvContent.split('\n');
+  let truncated = '';
+  let totalBytes = 0;
 
-  if (buffer.length > maxCsvLength) {
-    // Truncate without cutting a line in half
-    const lines = csvContent.split('\n');
-    let truncated = '';
-    let totalBytes = 0;
-
-    for (const line of lines) {
-      const lineBytes = Buffer.byteLength(line + '\n', 'utf8');
-      if (totalBytes + lineBytes > maxCsvLength) break;
-      truncated += line + '\n';
-      totalBytes += lineBytes;
+  // Always include header line if it exists
+  if (lines.length > 0) {
+    const headerLine = lines[0] + '\n';
+    const headerBytes = Buffer.byteLength(headerLine, 'utf8');
+    if (headerBytes <= maxCsvLength) {
+      truncated += headerLine;
+      totalBytes += headerBytes;
     }
-
-    preview = truncated.trimEnd() + '\n... [truncated]';
   }
 
-  return header + preview + footer;
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.trim()) continue; // Skip empty lines
+    
+    const lineBytes = Buffer.byteLength(line + '\n', 'utf8');
+    if (totalBytes + lineBytes > maxCsvLength) break;
+    truncated += line + '\n';
+    totalBytes += lineBytes;
+  }
+
+  if (lines.length > 1 && truncated.split('\n').length - 1 < lines.length) {
+    truncated = truncated.trimEnd() + truncationNote;
+  }
+
+  return header + truncated + footer;
 }
 
 /**
@@ -197,10 +209,10 @@ export async function sendErrorToSlack(context = {}, error) {
  * @param {number} summary.successful - Number of successful tests
  * @param {number} summary.failed - Number of failed tests
  * @param {Object} summary.averageScores - Average scores
- * @param {number} summary.averageScores.overall - Overall average score
- * @param {number} summary.averageScores.accuracy - Average accuracy score
- * @param {number} summary.averageScores.completeness - Average completeness score
- * @param {number} summary.averageScores.relevance - Average relevance score
+ * @param {number} [summary.averageScores.hamming_accuracy] - Mean Hamming accuracy
+ * @param {number} [summary.averageScores.exact_match] - Exact match rate
+ * @param {number} [summary.averageScores.macro_f1] - Label-macro F1
+ * @param {number} [summary.averageScores.format_valid] - Format validity rate
  * @param {string} csvContent - CSV content to include in the message
  * @returns {Promise<void>}
  */
@@ -223,6 +235,13 @@ export async function sendTestResultsToSlack(summary, csvContent) {
     if (score >= 0.8) return "🟢";
     if (score >= 0.6) return "🟡";
     return "🔴";
+  };
+
+  const scoreField = (label, score) => {
+    if (typeof score !== 'number' || Number.isNaN(score)) {
+      return `*${label}:*\nN/A`;
+    }
+    return `${getScoreEmoji(score)} *${label}:*\n${score.toFixed(4)}`;
   };
 
   /** @type {SlackWebhookPayload} */
@@ -282,19 +301,19 @@ export async function sendTestResultsToSlack(summary, csvContent) {
         fields: [
           {
             type: "mrkdwn",
-            text: `${getScoreEmoji(summary.averageScores.overall)} *Overall:*\n${summary.averageScores.overall.toFixed(4)}`
+            text: scoreField('Hamming', summary.averageScores.hamming_accuracy)
           },
           {
             type: "mrkdwn",
-            text: `${getScoreEmoji(summary.averageScores.accuracy)} *Accuracy:*\n${summary.averageScores.accuracy.toFixed(4)}`
+            text: scoreField('Exact match', summary.averageScores.exact_match)
           },
           {
             type: "mrkdwn",
-            text: `${getScoreEmoji(summary.averageScores.completeness)} *Completeness:*\n${summary.averageScores.completeness.toFixed(4)}`
+            text: scoreField('Macro-F1', summary.averageScores.macro_f1)
           },
           {
             type: "mrkdwn",
-            text: `${getScoreEmoji(summary.averageScores.relevance)} *Relevance:*\n${summary.averageScores.relevance.toFixed(4)}`
+            text: scoreField('Format valid', summary.averageScores.format_valid)
           }
         ]
       }
@@ -310,7 +329,7 @@ export async function sendTestResultsToSlack(summary, csvContent) {
         type: "section",
         text: {
           type: "mrkdwn",
-          text: "*CSV Results Preview:*"
+          text: "*Metrics CSV:*"
         }
       },
       {

@@ -1,0 +1,6 @@
+{
+  "temperature": 0,
+  "top_p": 0.95,
+  "max_tokens": 30000,
+  "use_structured_output": true
+}

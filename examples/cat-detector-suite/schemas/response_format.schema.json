@@ -1,0 +1,36 @@
+{
+  "title": "scene_audit",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "domestic_cat",
+    "person",
+    "wildlife_felid",
+    "contains_manmade_object",
+    "stated_confidence"
+  ],
+  "properties": {
+    "domestic_cat": {
+      "type": "boolean",
+      "description": "True if at least one domestic cat is visible."
+    },
+    "person": {
+      "type": "boolean",
+      "description": "True if at least one person is visible."
+    },
+    "wildlife_felid": {
+      "type": "boolean",
+      "description": "True if a wild felid is visible (lion, tiger, and similar)."
+    },
+    "contains_manmade_object": {
+      "type": "boolean",
+      "description": "True if a built or manufactured object is visible."
+    },
+    "stated_confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Model self-assessment of how sure it is that the four flags are correct (0–1). Not a harness score; gold labels omit this key."
+    }
+  }
+}

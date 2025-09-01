@@ -1,35 +1,44 @@
 import fs from 'fs/promises';
 import path from 'path';
 import { CONFIGURATION } from './config.js';
+import { brierScore, exactFieldMatch, meanFieldMatch, parseConfidence } from '../utils/report-utils.js';
 
 /**
- * Loads a custom evaluator if available
- * 
- * @param {string} type - Type of evaluator ('quantitative' or 'qualitative')
- * @returns {Function|null} - The evaluator function or null if not found
+ * @typedef {object} QuantitativeResult
+ * @property {Record<string, { predicted: unknown, gold: unknown, correct: boolean }>} [fields]
+ * @property {0|1} [format_valid]
+ * @property {string|null} [bucket]
+ * @property {string[]} [errors]
+ * @property {number|null} [hamming_accuracy]
+ * @property {number|null} [exact_match]
+ * @property {number|null} [stated_confidence]
+ * @property {number|null} [brier]
  */
+
+/**
+ * @typedef {object} QualitativeResult
+ * @property {string[]} strengths
+ * @property {string[]} weaknesses
+ * @property {string[]} suggestions
+ */
+
 async function loadCustomEvaluator(type) {
   try {
     const evaluatorPath = path.join(CONFIGURATION.directories.evaluators, `${type}.js`);
-    
-    // Check if the file exists
+
     try {
       await fs.access(evaluatorPath);
-    } catch (error) {
-      // File doesn't exist, return null
+    } catch {
       return null;
     }
-    
-    // Import the evaluator module
+
     const evaluatorModule = await import(`file://${evaluatorPath}`);
-    
-    // Get the appropriate function based on type
     const functionName = type === 'quantitative' ? 'evaluateQuantitative' : 'evaluateQualitative';
-    
+
     if (evaluatorModule && typeof evaluatorModule[functionName] === 'function') {
       return evaluatorModule[functionName];
     }
-    
+
     return null;
   } catch (error) {
     console.error(`Error loading ${type} evaluator:`, error);
@@ -37,140 +46,88 @@ async function loadCustomEvaluator(type) {
   }
 }
 
+function asFormatValid(value) {
+  if (value === true || value === 1) {
+    return 1;
+  }
+  if (value === false || value === 0) {
+    return 0;
+  }
+  return Number(value) === 1 ? 1 : 0;
+}
+
 /**
- * Main evaluation function that returns both quantitative scores and qualitative assessments
- * 
- * Key implementation details:
- * - Automatically parses string results into JSON objects
- * - Falls back to a simple object with raw_text if parsing fails
- * - Dynamically loads custom evaluators from the input/evaluators directory if available
- * - Uses default evaluators as fallback if custom evaluators aren't found
- * - Combines quantitative metrics and qualitative assessments into a single result
- * - Supports expected fields and relevant terms for content evaluation
- * 
- * @param {Object|string} result - The model result (JSON object or string)
- * @param {Object} options - Optional configuration parameters
- * @returns {Object} - Complete evaluation with scores and qualitative insights
+ * Run suite evaluators, then attach Hamming accuracy, exact match, and Brier from `fields` / `stated_confidence`.
+ *
+ * Suite `evaluateQuantitative(parsed, { input_data_file })` should return
+ * `{ fields, format_valid?, bucket?, errors }`.
+ * Suite `evaluateQualitative(parsed, { input_data_file })` should return
+ * `{ strengths, weaknesses, suggestions }`.
+ *
+ * @param {object|string} result
+ * @param {{ input_data_file?: string }} [options]
  */
 export async function evaluate(result, options = {}) {
-  // Parse result if it's a string
   let parsedResult = result;
   if (typeof result === "string") {
     try {
       parsedResult = JSON.parse(result);
-    } catch (error) {
-      // If not valid JSON, create a simple object
+    } catch {
       parsedResult = { raw_text: result };
     }
   }
 
-  // Load custom evaluators if available
   const customQuantitative = await loadCustomEvaluator('quantitative');
   const customQualitative = await loadCustomEvaluator('qualitative');
-  
-  // Use custom evaluators if available, otherwise use default
-  let quantitative = customQuantitative ? 
-    customQuantitative(parsedResult, options) : 
-    quantitativeEvaluation(parsedResult, options);
-    
-  // Ensure all required metrics are present and sensible
+
+  let quantitative = customQuantitative ?
+    customQuantitative(parsedResult, options) :
+    quantitativeEvaluation();
+
+  const exactMatch = exactFieldMatch(quantitative.fields);
+  const statedConfidence = parseConfidence(parsedResult?.stated_confidence);
   quantitative = {
-    accuracy: parseFloat(quantitative.accuracy || 0),
-    completeness: parseFloat(quantitative.completeness || 0),
-    relevance: parseFloat(quantitative.relevance || 0),
-    overall: parseFloat(quantitative.overall || 0),
+    ...quantitative,
+    hamming_accuracy: meanFieldMatch(quantitative.fields),
+    exact_match: exactMatch,
     errors: quantitative.errors || []
   };
-  
-  // If overall score is 0 but completeness is high, recalculate using the default formula
-  if (quantitative.overall === 0 && quantitative.completeness > 0) {
-    // Use default formula as fallback
-    const calculatedAccuracy = (quantitative.completeness + quantitative.relevance) / 2;
-    quantitative.accuracy = calculatedAccuracy;
-    quantitative.overall = (calculatedAccuracy * 0.4) + (quantitative.completeness * 0.4) + (quantitative.relevance * 0.2);
+  if (statedConfidence !== null) {
+    quantitative.stated_confidence = statedConfidence;
+    const brier = brierScore(statedConfidence, exactMatch);
+    if (brier !== null) {
+      quantitative.brier = brier;
+    }
   }
-    
-  const qualitative = customQualitative ? 
-    customQualitative(parsedResult, options) : 
+
+  if (quantitative.format_valid !== undefined) {
+    quantitative.format_valid = asFormatValid(quantitative.format_valid);
+  }
+
+  const qualitative = customQualitative ?
+    customQualitative(parsedResult, options) :
     qualitativeEvaluation(parsedResult, options);
-  
+
   return {
     quantitative,
     qualitative
   };
 }
 
-/**
- * Calculates quantitative metrics for a model result
- * This is the default implementation used when no custom evaluator is available
- * 
- * @param {Object} result - The model result (parsed)
- * @param {Object} options - Optional configuration parameters
- * @returns {Object} - Quantitative metrics
- */
-export function quantitativeEvaluation(result, options = {}) {
-  // Default metrics
-  const metrics = {
-    accuracy: 0,
-    completeness: 0,
-    relevance: 0,
-    overall: 0,
+export function quantitativeEvaluation() {
+  return {
     errors: []
   };
-  
-  try {
-    // Get expected fields from options or use defaults
-    const expectedFields = options.expectedFields || [];
-    const relevantTerms = options.relevantTerms || [];
-    
-    if (expectedFields.length > 0) {
-      // Calculate completeness based on presence of expected fields
-      const presentFields = expectedFields.filter(field => {
-        return field.alternateNames.some(name => result[name] !== undefined);
-      }).length;
-      metrics.completeness = expectedFields.length > 0 ? presentFields / expectedFields.length : 0;
-    }
-    
-    if (relevantTerms.length > 0) {
-      // Calculate relevance based on presence of relevant terms
-      const responseText = JSON.stringify(result).toLowerCase();
-      const relevantTermsFound = relevantTerms.filter(term => responseText.includes(term)).length;
-      metrics.relevance = relevantTerms.length > 0 ? relevantTermsFound / relevantTerms.length : 0;
-    } else {
-
-    }
-    
-    // Calculate accuracy and overall score
-    metrics.accuracy = options.accuracyFn ? options.accuracyFn(result, options) : (metrics.completeness + metrics.relevance) / 2;
-    metrics.overall = options.overallFn ? options.overallFn(metrics.accuracy, metrics.completeness, metrics.relevance, options) :
-        (metrics.accuracy * 0.4) + (metrics.completeness * 0.4) + (metrics.relevance * 0.2);
-
-    return metrics
-
-  } catch (error) {
-    metrics.errors.push(error);
-    return metrics
-  }
 }
 
-/**
- * Provides qualitative assessment of model results
- * This is the default implementation used when no custom evaluator is available
- * 
- * @param {Object} result - The model result (parsed)
- * @param {Object} options - Optional configuration parameters
- * @returns {Object} - Qualitative assessment
- */
 export function qualitativeEvaluation(result, options = {}) {
-  // Default assessment structure
   const assessment = {
     strengths: [],
     weaknesses: [],
     suggestions: []
   };
-  
+
   try {
-    // Use custom assessment function if provided
     if (options.assessmentFn && typeof options.assessmentFn === 'function') {
       const customAssessment = options.assessmentFn(result, options);
       if (customAssessment) {
@@ -178,26 +135,23 @@ export function qualitativeEvaluation(result, options = {}) {
         return assessment;
       }
     }
-    
-    // Get expected fields from options
+
     const expectedFields = options.expectedFields || [];
-    
-    // Check for strengths and weaknesses based on expected fields
+
     for (const field of expectedFields) {
       const hasField = field.alternateNames.some(name => result[name] !== undefined);
-      
+
       if (hasField) {
         assessment.strengths.push(`Contains ${field.description}`);
       } else {
         assessment.weaknesses.push(`Missing ${field.description}`);
       }
     }
-    
-    // Add generic suggestions based on weaknesses
+
     if (assessment.weaknesses.length > 0) {
       assessment.suggestions.push("Ensure all expected elements are included in the response");
     }
-    
+
     if (assessment.strengths.length < Math.ceil(expectedFields.length / 2)) {
       assessment.suggestions.push("Provide more comprehensive information in the response");
     }
@@ -206,7 +160,6 @@ export function qualitativeEvaluation(result, options = {}) {
     assessment.weaknesses.push("Error processing the response format");
     assessment.suggestions.push("Ensure response is properly formatted as requested");
   }
-  
+
   return assessment;
 }
-

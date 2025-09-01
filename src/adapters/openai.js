@@ -1,11 +1,12 @@
-
 import axios from 'axios';
+import { CONFIGURATION } from '../config.js';
 
 export default class OpenAIAdapter {
   constructor(config = {}) {
     this.baseUrl = config.baseUrl || 'http://127.0.0.1:1234';
     this.model = normalizeModelId(config.model);
-    this.temperature = config.temperature || 0.7;
+    this.temperature = config.temperature ?? CONFIGURATION.models.temperature;
+    this.max_tokens = config.max_tokens ?? CONFIGURATION.models.max_tokens;
     this.timeout = parseInt(process.env.REQUEST_TIMEOUT_MS || '900000', 10);
     
     this.authUsername = process.env.AUTH_USERNAME;
@@ -21,29 +22,12 @@ export default class OpenAIAdapter {
     console.log(`OpenAIAdapter initialized with model: ${this.model}, max_tokens: ${this.max_tokens}`);
   }
   
-  /**
-   * Get a filesystem-safe version of the model ID for file paths
-   * 
-   * @param {string} modelId - The model ID to normalize for file paths
-   * @returns {string} - The normalized model ID safe for file paths
-   */
   static getModelIdForFilePath(modelId) {
     return normalizeModelIdForFilePath(modelId);
   }
 
-  /**
-   * Execute a prompt with the model
-   * 
-   * This method is maintained for backward compatibility.
-   * It internally converts the prompt to a chat format and calls the chat method.
-   * 
-   * @param {string|object} prompt - The prompt to send to the model
-   * @param {object} options - Additional options for the model
-   * @returns {Promise<object>} The model's response
-   */
   async execute(prompt, options = {}) {
     try {
-      // Convert to chat format
       const messages = [
         { role: 'user', content: prompt }
       ];
@@ -55,37 +39,22 @@ export default class OpenAIAdapter {
     }
   }
 
-  /**
-   * Execute a chat completion with the model
-   * This is the recommended method for all model interactions
-   * 
-   * Key implementation details:
-   * - Supports JSON schema for structured output
-   * - Implements request timeout using AbortController
-   * - Handles errors with detailed error messages
-   * - Supports all OpenAI chat completion parameters
-   * 
-   * @param {Array} messages - Array of message objects with role and content
-   * @param {object} options - Additional options for the model
-   * @returns {Promise<object>} The model's response
-   */
   async chat(messages, options = {}) {
     const endpoint = `${this.baseUrl}/v1/chat/completions`;
     
-    // If a specific model is provided in options, normalize it
     const modelToUse = options.model ?
         normalizeModelId(options.model) :
       this.model;
 
-    // Calculate total input tokens (approximate)
     let inputTokenCount = 0;
     messages.forEach(msg => {
-      // Rough estimate: 1 token ≈ 4 characters for English text
-      inputTokenCount += Math.ceil((msg.content?.length || 0) / 4);
+      inputTokenCount += estimateContentTokens(msg.content);
     });
     
-    const defaultMaxTokens = options.max_tokens || this.max_tokens;
-    const safeMaxTokens = Math.max(defaultMaxTokens, 32000 - inputTokenCount);
+    const defaultMaxTokens = options.max_tokens ?? this.max_tokens;
+    const contextWindowTokens = 32000;
+    const remainingContext = contextWindowTokens - inputTokenCount;
+    const safeMaxTokens = Math.max(defaultMaxTokens, remainingContext);
     
     console.log(`Estimated input tokens: ~${inputTokenCount}`);
     console.log(`Adjusted max_tokens to: ${safeMaxTokens} (from ${defaultMaxTokens})`);
@@ -102,7 +71,7 @@ export default class OpenAIAdapter {
       requestBody.response_format = {
         type: "json_schema",
         json_schema: {
-          name: "contract_analysis",
+          name: options.schema.title || 'structured_output',
           strict: true,
           schema: options.schema
         }
@@ -112,10 +81,8 @@ export default class OpenAIAdapter {
     console.log(`Request timeout set to ${this.timeout}ms`);
     
     try {
-      // Start timing the request
       const startTime = Date.now();
       
-      // Configure axios for large responses
       const headers = {
         'Content-Type': 'application/json',
       };
@@ -134,19 +101,15 @@ export default class OpenAIAdapter {
         maxBodyLength: Infinity
       });
       
-      // End timing the request
       const endTime = Date.now();
       const completionTime = endTime - startTime;
       
-      // Axios automatically parses JSON responses
       const responseData = response.data;
       
-      // Log response details for debugging
       if (responseData.choices && responseData.choices[0] && responseData.choices[0].message) {
         const contentLength = responseData.choices[0].message.content?.length || 0;
         console.log(`Response content length: ${contentLength} characters`);
         
-        // Check for potentially truncated responses
         if (contentLength > 0 && responseData.choices[0].finish_reason === 'length') {
           console.warn('Warning: Response may be truncated (finish_reason=length)');
         }
@@ -164,34 +127,20 @@ export default class OpenAIAdapter {
         throw new Error(`Request timed out after ${this.timeout}ms`);
       }
       
-      // Enhanced error reporting
       if (error.response) {
-        // The request was made and the server responded with a status code
         console.error('Error response data:', error.response.data);
         console.error('Error response status:', error.response.status);
         throw new Error(`API request failed with status ${error.response.status}: ${JSON.stringify(error.response.data)}`);
       } else if (error.request) {
-        // The request was made but no response was received
         console.error('No response received:', error.request);
         throw new Error(`No response received from server: ${error.message}`);
       } else {
-        // Something happened in setting up the request
         console.error('Error setting up request:', error.message);
         throw error;
       }
     }
   }
   
-  /**
-   * List available models
-   * 
-   * Key implementation details:
-   * - Queries the v1/models endpoint to get available models
-   * - Handles errors with detailed error messages
-   * - Implements request timeout using AbortController
-   * 
-   * @returns {Promise<object>} List of available models
-   */
   async listModels() {
     const endpoint = `${this.baseUrl}/v1/models`;
     
@@ -226,6 +175,31 @@ export default class OpenAIAdapter {
       }
     }
   }
+}
+
+/**
+ * Approximate input tokens for chat content.
+ * Text: ~4 characters per token. Images: IMAGE_TOKEN_ALLOWANCE (request budget, not an API field).
+ *
+ * @param {string|Array|undefined} content
+ * @returns {number}
+ */
+function estimateContentTokens(content) {
+  if (typeof content === 'string') {
+    return Math.ceil(content.length / 4);
+  }
+  if (!Array.isArray(content)) {
+    return 0;
+  }
+  return content.reduce((tokens, part) => {
+    if (part?.type === 'text') {
+      return tokens + Math.ceil((part.text?.length || 0) / 4);
+    }
+    if (part?.type === 'image_url') {
+      return tokens + CONFIGURATION.performance.imageTokenAllowance;
+    }
+    return tokens;
+  }, 0);
 }
 
 /**

@@ -4,23 +4,32 @@ import crypto from 'crypto';
 import { ensureDir } from './file-utils.js';
 
 /**
- * Generates a cache key for a prompt-data combination
- * 
+ * Generates a cache key for a prompt-data combination.
+ * Image sidecars are hashed by bytes so keys stay small and stable.
+ *
  * @param {string} model - The model ID
  * @param {Object} prompt - The prompt object
- * @param {string} data - The data content
+ * @param {string|{text?: string, images?: Array<{filename: string, mime: string, buffer: Buffer}>}} data
  * @returns {string} - A unique hash for this combination
  */
 export function generateCacheKey(model, prompt, data) {
-  const content = JSON.stringify({
+  const text = typeof data === 'string' ? data : (data?.text || '');
+  const images = Array.isArray(data?.images)
+    ? data.images.map(img => ({
+        filename: img.filename,
+        mime: img.mime,
+        hash: crypto.createHash('md5').update(img.buffer).digest('hex')
+      }))
+    : [];
+
+  return crypto.createHash('md5').update(JSON.stringify({
     model,
     promptType: prompt.type,
     promptName: prompt.name,
     promptContent: prompt.content,
-    data
-  });
-  
-  return crypto.createHash('md5').update(content).digest('hex');
+    text,
+    images
+  })).digest('hex');
 }
 
 /**

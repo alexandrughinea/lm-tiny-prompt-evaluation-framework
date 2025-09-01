@@ -1,26 +1,17 @@
 import fs from 'fs/promises';
 import path from 'path';
+import {fileURLToPath} from 'url';
 import {evaluate} from './evaluator.js';
 import {CONFIGURATION} from './config.js';
 import OpenAIAdapter from './adapters/openai.js';
 import {ensureDir} from '../utils/file-utils.js';
-import {CSV_FORMAT, escapeCSV, getCSVColumns, getCSVColumnsJoined, getCSVDataMap, formatProcessingTime} from '../utils/csv-utils.js';
+import {CSV_FORMAT, escapeCSV, getCSVColumns, getCSVColumnsJoined, getCSVDataMap, formatProcessingTime, writeMetricsCsv} from '../utils/csv-utils.js';
+import { detectReportMeta, fieldMatchScore, fieldMissCount, formatGold, formatMatch, formatPredicted, humanizeFieldName, macroF1FromResults, markdownTable, perFieldClassification, resolveFieldNames } from '../utils/report-utils.js';
 import {generateCacheKey, getFromCache, saveToCache} from '../utils/cache-utils.js';
 import { sendTestResultsToSlack, sendErrorToSlack } from '../utils/slack.js';
+import { isImageExtension, loadSidecarImages, loadStandaloneImageCases, toDataUrl } from '../utils/media-utils.js';
 
-
-/**
- * Load all available prompts from the prompts directory
- * 
- * Key implementation details:
- * - Only loads files with exact .txt extension
- * - Skips backup files and other non-txt files
- * - Categorizes prompts based on their prefix:
- *   - system_*: For system role in chat completions
- *   - user_*: For user role in chat completions
- *   - assistant_*: For assistant role in chat completions
- *   - others: For legacy completions endpoint
- */
+/** Load `.txt` prompts and tag them as system, user, assistant, or legacy. */
 async function loadPrompts() {
   try {
     const promptFiles = await fs.readdir(CONFIGURATION.directories.prompts);
@@ -59,30 +50,37 @@ async function loadPrompts() {
   }
 }
 
-/**
- * Load all available data from the data directory
- * 
- * Key implementation details:
- * - Only loads files with exact .txt extension
- * - Skips backup files and other non-txt files
- * - Creates a map of data files keyed by filename without extension
- */
+/** Load text cases (with sidecar images) and standalone image-only cases. */
 async function loadData() {
   try {
-    const dataFiles = await fs.readdir(CONFIGURATION.directories.data);
+    const dataDir = CONFIGURATION.directories.data;
+    const files = await fs.readdir(dataDir);
     const data = Object.create(null);
-    const extension = '.txt';
+    const txtBasenames = [];
 
-    for (const file of dataFiles) {
-      if (path.extname(file) === extension) {
-        const inputDataFileBaseName = path.basename(file, extension);
-        const inputDataFilePath = path.join(CONFIGURATION.directories.data, file);
-
-        data[inputDataFileBaseName] = await fs.readFile(inputDataFilePath, 'utf8');
-        console.log(`Loaded data file: ${file}`);
-      } else {
-        console.log(`Skipping non-txt file: ${file}`);
+    for (const file of files) {
+      if (path.extname(file) !== '.txt') {
+        if (!isImageExtension(file)) {
+          console.log(`Skipping non-txt file: ${file}`);
+        }
+        continue;
       }
+
+      const name = path.basename(file, '.txt');
+      const text = await fs.readFile(path.join(dataDir, file), 'utf8');
+      const images = await loadSidecarImages(dataDir, name, files);
+      data[name] = { text, images };
+      txtBasenames.push(name);
+
+      const sidecarNote = images.length
+        ? ` (${images.length} sidecar image${images.length === 1 ? '' : 's'})`
+        : '';
+      console.log(`Loaded data file: ${file}${sidecarNote}`);
+    }
+
+    for (const imageCase of await loadStandaloneImageCases(dataDir, files, txtBasenames)) {
+      data[imageCase.name] = { text: imageCase.text, images: imageCase.images };
+      console.log(`Loaded image-only data: ${imageCase.name} (${imageCase.images.map(img => img.filename).join(', ')})`);
     }
 
     return data;
@@ -92,9 +90,148 @@ async function loadData() {
   }
 }
 
-/**
- * Get available models from the server
- */
+function dataText(dataRecord) {
+  return typeof dataRecord === 'string' ? dataRecord : (dataRecord?.text || '');
+}
+
+function inputKind(dataRecord) {
+  const hasText = dataText(dataRecord).trim().length > 0;
+  const hasImages = (dataRecord?.images?.length || 0) > 0;
+  if (hasText && hasImages) {
+    return 'mixed';
+  }
+  if (hasImages) {
+    return 'image';
+  }
+  return 'text';
+}
+
+const PROMPT_EXCERPT_MAX = 1500;
+
+function excerptText(text, max = PROMPT_EXCERPT_MAX) {
+  const value = typeof text === 'string' ? text.trim() : '';
+  if (!value) {
+    return '';
+  }
+  if (value.length <= max) {
+    return value;
+  }
+  return `${value.slice(0, max).trimEnd()}\n...`;
+}
+
+function pairedPromptContent(allPrompts, promptName, type) {
+  for (const prompt of Object.values(allPrompts)) {
+    if (prompt.name === promptName && prompt.type === type) {
+      return prompt.content || '';
+    }
+  }
+  return '';
+}
+
+function buildTask(allPrompts, promptContent) {
+  const system = promptContent.type === 'system'
+    ? promptContent.content
+    : pairedPromptContent(allPrompts, promptContent.name, 'system');
+  const user = promptContent.type === 'user' || promptContent.type === 'legacy'
+    ? promptContent.content
+    : pairedPromptContent(allPrompts, promptContent.name, 'user');
+  return {
+    experiment: CONFIGURATION.experiment,
+    prompt_name: promptContent.name,
+    system: excerptText(system),
+    user: excerptText(user)
+  };
+}
+
+function inputFiles(caseName, dataRecord) {
+  const files = [];
+  if (dataText(dataRecord).trim().length > 0) {
+    files.push(`${caseName}.txt`);
+  }
+  for (const image of dataRecord?.images || []) {
+    files.push(image.filename);
+  }
+  if (files.length === 0) {
+    files.push(caseName);
+  }
+  return files;
+}
+
+function buildInput(caseName, dataRecord) {
+  return {
+    case: caseName,
+    kind: inputKind(dataRecord),
+    files: inputFiles(caseName, dataRecord)
+  };
+}
+
+function fence(text) {
+  return `\`\`\`\n${text || ''}\n\`\`\`\n`;
+}
+
+function uniqueValues(results, getter) {
+  return [...new Set(results.map(getter).filter(Boolean))];
+}
+
+function contentCharLength(content) {
+  if (typeof content === 'string') {
+    return content.length;
+  }
+  if (Array.isArray(content)) {
+    return content.reduce((n, part) => n + (part.text?.length || 0), 0);
+  }
+  return 0;
+}
+
+function buildUserContent(promptAndDocumentText, dataRecord) {
+  const images = dataRecord?.images || [];
+  if (images.length === 0) {
+    return promptAndDocumentText;
+  }
+
+  const names = images.map(img => img.filename).join(', ');
+  return [
+    { type: 'text', text: `${promptAndDocumentText}\n\nAttached images: ${names}` },
+    ...images.map(img => ({
+      type: 'image_url',
+      image_url: { url: toDataUrl(img.buffer, img.mime) }
+    }))
+  ];
+}
+
+function buildRoleContent(role, promptText, dataRecord) {
+  const text = `${promptText}${dataText(dataRecord)}`;
+  if (role === 'user') {
+    return buildUserContent(text, dataRecord);
+  }
+  return text;
+}
+
+function isCachingEnabled() {
+  return Boolean(CONFIGURATION.performance.caching?.enabled);
+}
+
+async function readCachedResponse(model, prompt, dataRecord) {
+  if (!isCachingEnabled()) {
+    return null;
+  }
+  return getFromCache(
+    CONFIGURATION.performance.caching.directory,
+    generateCacheKey(model, prompt, dataRecord)
+  );
+}
+
+async function writeCachedResponse(model, prompt, dataRecord, response) {
+  if (!isCachingEnabled()) {
+    return;
+  }
+  await saveToCache(
+    CONFIGURATION.performance.caching.directory,
+    generateCacheKey(model, prompt, dataRecord),
+    response
+  );
+}
+
 async function getAvailableModels() {
   try {
     const adapter = new OpenAIAdapter({
@@ -109,43 +246,20 @@ async function getAvailableModels() {
   }
 }
 
-/**
- * Execute a prompt with a model
- * 
- * Key implementation details:
- * - Supports both chat (system/user/assistant roles) and legacy completion modes
- * - Automatically detects prompt type and uses appropriate API endpoint
- * - Combines prompts with the same base name but different roles (system/user/assistant)
- * - Handles JSON schema validation for structured outputs
- * - Sets default content for required roles if not found
- * - Uses OpenAIAdapter to make API requests with configurable timeout
- * 
- * @param {string} model - The model ID to use
- * @param {Object} prompt - The prompt object with type, content, and name
- * @param {string} file - The file text to analyze
- * @param {string} input_user_prompt - The original prompt file name (for reference)
- * @param {Object} allPrompts - All available prompts for finding matching pairs
- * @param {Object} options - Additional options for the request
- * @returns {Object} - The model response
- */
-async function executePrompt(model, prompt, file, input_user_prompt, allPrompts, options = {}) {
+async function executePrompt(model, prompt, dataRecord, input_user_prompt, allPrompts, options = {}) {
   try {
-    // Check cache first if caching is enabled
-    if (CONFIGURATION.performance.caching && CONFIGURATION.performance.caching.enabled) {
-      const cacheKey = generateCacheKey(model, prompt, file);
-      const cachedResponse = await getFromCache(CONFIGURATION.performance.caching.directory, cacheKey);
-
-      if (cachedResponse) {
-        console.log(`Using cached response for model: ${model}, prompt: ${prompt.name}`);
-        return cachedResponse;
-      }
+    const cachedResponse = await readCachedResponse(model, prompt, dataRecord);
+    if (cachedResponse) {
+      console.log(`Using cached response for model: ${model}, prompt: ${prompt.name}`);
+      return cachedResponse;
     }
 
     const useChatMode = prompt.type === 'system' || prompt.type === 'user';
 
-    const fullPrompt = `${prompt.content}${file}`;
-    const enhancedPrompt = fullPrompt;
-    const useSchema = process.env.USE_STRUCTURED_OUTPUT_SCHEMA === 'true';
+    const documentText = dataText(dataRecord);
+    const imageCount = dataRecord?.images?.length || 0;
+    const fullPrompt = `${prompt.content}${documentText}`;
+    const useSchema = CONFIGURATION.structuredOutput;
     let schema = null;
 
     console.log(`Using ${useChatMode ? 'chat' : 'legacy'} mode for prompt: ${prompt.name}`);
@@ -161,7 +275,7 @@ async function executePrompt(model, prompt, file, input_user_prompt, allPrompts,
         console.log('Proceeding without schema validation');
       }
     } else {
-      console.log('JSON schema validation disabled (temporarily)');
+      console.log('JSON schema validation disabled');
     }
 
     const modelAdapter = new OpenAIAdapter({
@@ -171,17 +285,8 @@ async function executePrompt(model, prompt, file, input_user_prompt, allPrompts,
       max_tokens: CONFIGURATION.models.max_tokens
     });
 
-    console.log(`Request details: ${JSON.stringify({
-      model: model,
-      prompt_length: enhancedPrompt.length,
-      max_tokens: CONFIGURATION.models.max_tokens,
-      temperature: CONFIGURATION.models.temperature,
-      top_p: CONFIGURATION.models.top_p
-    })}`);
-
     console.log(`Using OpenAIAdapter to connect to ${CONFIGURATION.modelServer.url}`);
 
-    // Prepare options for the adapter
     const adapterOptions = {
       temperature: options.temperature || CONFIGURATION.models.temperature,
       max_tokens: options.max_tokens || CONFIGURATION.models.max_tokens,
@@ -189,142 +294,118 @@ async function executePrompt(model, prompt, file, input_user_prompt, allPrompts,
       schema: useSchema ? schema : null
     };
 
-    // Debug the request
     console.log('Request details:', JSON.stringify({
       model: model,
-      prompt_length: enhancedPrompt.length,
+      prompt_length: fullPrompt.length,
+      image_count: imageCount,
       max_tokens: adapterOptions.max_tokens,
       temperature: adapterOptions.temperature,
       top_p: adapterOptions.top_p
     }));
 
-    // Handle different prompt types
     if (useChatMode) {
-      // Initialize messages array
-      const messages = [];
       const contentMap = {
         system: null,
         user: null,
         assistant: null
       };
 
-      // Add the current prompt to the appropriate content type
-      switch (prompt.type) {
-        case 'system':
-          contentMap.system = enhancedPrompt;
-          break;
-        case 'user':
-          contentMap.user = enhancedPrompt;
-          break;
-        case 'assistant':
-          contentMap.assistant = enhancedPrompt;
-          break;
+      if (Object.hasOwn(contentMap, prompt.type)) {
+        contentMap[prompt.type] = buildRoleContent(prompt.type, prompt.content, dataRecord);
       }
 
-      // Look for matching prompts with the same base name but different roles
-      const baseName = prompt.name;
       for (const [otherPromptFile, otherPrompt] of Object.entries(allPrompts)) {
-        // Skip if it's the same prompt we're already using
         if (otherPromptFile === input_user_prompt) continue;
 
-        // Only process if it's a matching prompt with the same base name
-        if (otherPrompt.name === baseName && !contentMap[otherPrompt.type]) {
-          // Add content for this role
-          contentMap[otherPrompt.type] = `${otherPrompt.content}${file}`;
+        if (otherPrompt.name === prompt.name && !contentMap[otherPrompt.type]) {
+          contentMap[otherPrompt.type] = buildRoleContent(otherPrompt.type, otherPrompt.content, dataRecord);
           console.log(`Found matching ${otherPrompt.type} prompt: ${otherPromptFile}`);
         }
       }
 
-      // Set default content for required roles if not found
       if (!contentMap.system) {
         contentMap.system = 'You are an AI assistant analyzing data. Provide structured analysis based on the document text.';
         console.log('Using default system content');
       }
 
       if (!contentMap.user) {
-        contentMap.user = 'Please analyze this document.';
+        contentMap.user = buildUserContent('Please analyze this document.', dataRecord);
         console.log('Using default user content');
       }
 
-      // Build messages array in the correct order
-      messages.push({ role: 'system', content: contentMap.system });
-      messages.push({ role: 'user', content: contentMap.user });
-
-      // Add assistant message if available
+      const messages = [
+        { role: 'system', content: contentMap.system },
+        { role: 'user', content: contentMap.user }
+      ];
       if (contentMap.assistant) {
         messages.push({ role: 'assistant', content: contentMap.assistant });
-        console.log(`Using messages with system (${contentMap.system.length} chars), user (${contentMap.user.length} chars), and assistant (${contentMap.assistant.length} chars) roles`);
-      } else {
-        console.log(`Using messages with system (${contentMap.system.length} chars) and user (${contentMap.user.length} chars) roles`);
       }
 
-      // Use the adapter's chat method
+      const roleSummary = messages
+        .map(msg => `${msg.role} (${contentCharLength(msg.content)} chars)`)
+        .join(', ');
+      console.log(`Using messages with ${roleSummary} roles`);
       console.log('Using chat completion endpoint with messages format');
+
       const data = await modelAdapter.chat(messages, adapterOptions);
-
-      // Cache the response if caching is enabled
-      if (CONFIGURATION.performance.caching && CONFIGURATION.performance.caching.enabled) {
-        const cacheKey = generateCacheKey(model, prompt, file);
-        await saveToCache(CONFIGURATION.performance.caching.directory, cacheKey, data);
-      }
-
-      return data;
-    } else {
-      // For legacy prompts, use the execute method which will internally convert to chat format
-      console.log('Using legacy completion endpoint (will be converted to chat format)');
-      const data = await modelAdapter.execute(enhancedPrompt, adapterOptions);
-
-      // Cache the response if caching is enabled
-      if (CONFIGURATION.performance.caching && CONFIGURATION.performance.caching.enabled) {
-        const cacheKey = generateCacheKey(model, prompt, file);
-        await saveToCache(CONFIGURATION.performance.caching.directory, cacheKey, data);
-      }
-
+      await writeCachedResponse(model, prompt, dataRecord, data);
       return data;
     }
+
+    console.log('Using legacy completion endpoint (will be converted to chat format)');
+    const data = await modelAdapter.execute(buildUserContent(fullPrompt, dataRecord), adapterOptions);
+    await writeCachedResponse(model, prompt, dataRecord, data);
+    return data;
   } catch (error) {
-    // Extract the root error message without stack trace
     const errorMessage = error.cause ? error.cause.code : error.message;
     console.error(`Error executing prompt with model ${model}: ${errorMessage}`);
     throw error;
   }
 }
 
-/**
- * Parse JSON from model response
- * 
- * @param {Object} response - The raw model response
- * @returns {Object|string} - Parsed JSON or raw text
- */
+function asText(value) {
+  if (typeof value === 'string') {
+    return value.trim();
+  }
+  if (Array.isArray(value)) {
+    return value.map(part => part?.text || part?.content || '').join('').trim();
+  }
+  return '';
+}
+
+function messageText(response) {
+  const message = response.choices?.[0]?.message || {};
+  const content = asText(message.content);
+  if (content) {
+    return content;
+  }
+  const reasoning = asText(message.reasoning_content || message.reasoning);
+  if (reasoning) {
+    console.warn('message.content was empty; using reasoning_content');
+    return reasoning;
+  }
+  return asText(response.choices?.[0]?.text);
+}
+
 async function parseJsonFromResponse(response) {
   try {
-    // Extract the text from the response - handle both completions and chat formats
-    const text = response.choices?.[0]?.message?.content || response.choices?.[0]?.text || '';
+    const text = messageText(response);
 
-    // Try multiple approaches to extract JSON
-
-    // Approach 1: Try to parse the entire text as JSON
     try {
       return JSON.parse(text);
-    } catch (e) {
-      // Not valid JSON, continue to next approach
+    } catch {
     }
 
-    // Approach 2: Try to find JSON object pattern with regex
     const jsonMatch = text.match(/\{[\s\S]*\}/m);
     if (jsonMatch) {
       try {
-        // Clean up the JSON string - remove any markdown code block markers
-        let jsonStr = jsonMatch[0];
-        jsonStr = jsonStr.replace(/^```json\n|^```\n|\n```$/gm, '');
-
+        const jsonStr = jsonMatch[0].replace(/^```json\n|^```\n|\n```$/gm, '');
         return JSON.parse(jsonStr);
       } catch (e) {
         console.warn('Found JSON-like pattern but failed to parse:', e.message);
       }
     }
 
-    // Approach 3: Try to find JSON array pattern
     const arrayMatch = text.match(/\[[\s\S]*\]/m);
     if (arrayMatch) {
       try {
@@ -334,16 +415,10 @@ async function parseJsonFromResponse(response) {
       }
     }
 
-    // Approach 4: Try to fix common JSON issues and parse again
     try {
-      // Replace single quotes with double quotes
       let fixedText = text.replace(/'/g, '"');
-      // Remove trailing commas in objects and arrays
       fixedText = fixedText.replace(/,\s*(\}|\])/g, '$1');
-      // Remove comments
       fixedText = fixedText.replace(/\/\/.*$/gm, '');
-
-      // Try to extract JSON again with the fixed text
       const fixedJsonMatch = fixedText.match(/\{[\s\S]*\}/m);
       if (fixedJsonMatch) {
         return JSON.parse(fixedJsonMatch[0]);
@@ -352,7 +427,6 @@ async function parseJsonFromResponse(response) {
       console.warn('Failed to parse after fixing common issues:', e.message);
     }
 
-    // If all parsing attempts fail, return the text as is
     console.warn('All JSON parsing attempts failed, returning raw text');
     return text;
   } catch (error) {
@@ -361,27 +435,12 @@ async function parseJsonFromResponse(response) {
   }
 }
 
-/**
- * Evaluate a model's response
- * 
- * @param {Object|string} parsedResponse - The parsed model response
- * @param {Object} evaluationOptions - Options for evaluation
- * @returns {Object} - Evaluation results with metrics
- */
 async function evaluateResponse(parsedResponse, evaluationOptions = {}) {
   try {
-    // Use the generic evaluate function to evaluate the response
     const evaluation = await evaluate(parsedResponse, evaluationOptions);
 
-    // Extract quantitative metrics from the evaluation
-    const quantitative = {
-      accuracy: evaluation.quantitative?.accuracy || 0,
-      completeness: evaluation.quantitative?.completeness || 0,
-      relevance: evaluation.quantitative?.relevance || 0,
-      overall: evaluation.quantitative?.overall || 0
-    };
+    const quantitative = { ...(evaluation.quantitative || {}) };
 
-    // Get qualitative assessment
     const qualitative = evaluation.qualitative || {
       strengths: [],
       weaknesses: [],
@@ -398,191 +457,307 @@ async function evaluateResponse(parsedResponse, evaluationOptions = {}) {
   }
 }
 
-/**
- * Generate a markdown report from the results
- * 
- * @param {Array} results - The test results to generate a report from
- * @returns {string} - Markdown report
- */
+function scoreCell(value) {
+  return typeof value === 'number' && !Number.isNaN(value) ? value.toFixed(2) : 'N/A';
+}
+
+function averageBy(results, getter) {
+  const values = results.map(getter).filter(value => typeof value === 'number' && !Number.isNaN(value));
+  if (values.length === 0) {
+    return null;
+  }
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function fieldTableHeaders(meta) {
+  const headers = ['Case'];
+  if (meta.kind) {
+    headers.push('Kind');
+  }
+  if (meta.bucket) {
+    headers.push('Bucket');
+  }
+  headers.push('Field', 'Predicted', 'Gold', 'Match');
+  return headers;
+}
+
+function fieldTableRow(result, name, meta) {
+  const fields = result.quantitative?.fields || {};
+  const row = [result.input?.case || result.input_data_file];
+  if (meta.kind) {
+    row.push(result.input?.kind || result.input_kind || 'N/A');
+  }
+  if (meta.bucket) {
+    row.push(result.quantitative?.bucket || 'N/A');
+  }
+  row.push(
+    humanizeFieldName(name),
+    formatPredicted(fields, name),
+    formatGold(fields, name),
+    formatMatch(fields, name)
+  );
+  return row;
+}
+
+function meanHamming(results) {
+  return averageBy(results, result => result.quantitative?.hamming_accuracy);
+}
+
+function meanExactMatch(results) {
+  return averageBy(results, result => result.quantitative?.exact_match);
+}
+
+function groupBy(results, getter) {
+  const groups = Object.create(null);
+  for (const result of results) {
+    const key = getter(result) || 'N/A';
+    if (!groups[key]) {
+      groups[key] = [];
+    }
+    groups[key].push(result);
+  }
+  return groups;
+}
+
+function scoreHeaders(prefix, meta) {
+  const headers = [...prefix];
+  if (meta.format_valid) {
+    headers.push('Format valid');
+  }
+  if (meta.fields.length > 0) {
+    headers.push('Hamming', 'Exact match', 'Macro-F1');
+    headers.push(...meta.fields.map(humanizeFieldName));
+  }
+  return headers;
+}
+
+function scoreCells(groupResults, meta) {
+  const cells = [];
+  if (meta.format_valid) {
+    cells.push(scoreCell(averageBy(groupResults, result => result.quantitative.format_valid)));
+  }
+  if (meta.fields.length > 0) {
+    cells.push(scoreCell(meanHamming(groupResults)));
+    cells.push(scoreCell(meanExactMatch(groupResults)));
+    cells.push(scoreCell(macroF1FromResults(groupResults, meta.fields)));
+    for (const name of meta.fields) {
+      cells.push(scoreCell(averageBy(groupResults, result => fieldMatchScore(result.quantitative.fields, name))));
+    }
+  }
+  return cells;
+}
+
 function generateReport(results) {
-  // Create a markdown report with tables for each model and prompt
-  let report = `# Model Evaluation Report\n\n`;
+  const meta = detectReportMeta(results);
+  const sample = results[0] || {};
+  const task = sample.task || {};
+  const models = uniqueValues(results, result => result.model);
+  const promptNames = uniqueValues(results, result => result.task?.prompt_name || result.prompt_name);
+  const kinds = uniqueValues(results, result => result.input?.kind || result.input_kind);
+
+  const missRows = [];
+  const allRows = [];
+  let missCases = 0;
+  for (const result of results) {
+    let caseMiss = false;
+    for (const name of meta.fields) {
+      const row = fieldTableRow(result, name, meta);
+      allRows.push(row);
+      if (fieldMatchScore(result.quantitative?.fields, name) === 0) {
+        missRows.push(row);
+        caseMiss = true;
+      }
+    }
+    if (caseMiss) {
+      missCases += 1;
+    }
+  }
+
+  let report = `# ${task.experiment || CONFIGURATION.experiment} — evaluation report\n\n`;
   report += `Generated: ${new Date().toLocaleString()}\n\n`;
 
-  // Summary table
-  report += `## Summary\n\n`;
-  report += `| Model | Prompt | Document | Overall Score | Accuracy | Completeness | Relevance | Processing Time |\n`;
-  report += `|-------|--------|----------|--------------|----------|--------------|-----------|-----------------|\n`;
-
-  for (const result of results) {
-    const { model, input_user_prompt, input_data_file, quantitative, processing_time } = result;
-    const formattedTime = processing_time ? `${(processing_time / 1000).toFixed(1)}s` : 'N/A';
-    report += `| ${model} | ${input_user_prompt} | ${input_data_file} | ${quantitative.overall.toFixed(2)} | ${quantitative.accuracy.toFixed(2)} | ${quantitative.completeness.toFixed(2)} | ${quantitative.relevance.toFixed(2)} | ${formattedTime} |\n`;
+  report += `## Task\n\n`;
+  report += `- Experiment: ${task.experiment || CONFIGURATION.experiment}\n`;
+  report += `- Models: ${models.join(', ') || 'N/A'}\n`;
+  report += `- Prompt: ${promptNames.join(', ') || 'N/A'}\n\n`;
+  const tasksByPrompt = groupBy(results, result => result.task?.prompt_name || result.prompt_name);
+  for (const [name, promptResults] of Object.entries(tasksByPrompt)) {
+    const promptTask = promptResults[0]?.task || {};
+    if (Object.keys(tasksByPrompt).length > 1) {
+      report += `### ${name}\n\n`;
+    }
+    if (promptTask.system) {
+      report += `**System**\n\n${fence(promptTask.system)}\n`;
+    }
+    if (promptTask.user) {
+      report += `**User**\n\n${fence(promptTask.user)}\n`;
+    }
   }
 
-  // Model comparison
-  report += `\n## Model Comparison\n\n`;
+  report += `## Data\n\n`;
+  report += `- Cases: ${results.length}\n`;
+  report += `- Kinds: ${kinds.join(', ') || 'N/A'}\n`;
+  if (meta.bucket) {
+    report += `- Buckets: ${uniqueValues(results, result => result.quantitative?.bucket).join(', ')}\n`;
+  }
+  report += `\n`;
 
-  // Group results by model
-  const modelGroups = {};
-  for (const result of results) {
-    const { model, quantitative } = result;
-    if (!modelGroups[model]) {
-      modelGroups[model] = [];
-    }
-    modelGroups[model].push(quantitative);
+  report += `## Headline\n\n`;
+  report += `- Hamming accuracy: ${scoreCell(meanHamming(results))}\n`;
+  report += `- Exact match: ${scoreCell(meanExactMatch(results))}\n`;
+  report += `- Macro-F1: ${scoreCell(macroF1FromResults(results, meta.fields))}\n`;
+  report += `- Brier: ${scoreCell(averageBy(results, result => result.quantitative?.brier))}\n`;
+  report += `- Stated confidence: ${scoreCell(averageBy(results, result => result.quantitative?.stated_confidence))}\n`;
+  if (meta.format_valid) {
+    report += `- Format valid: ${scoreCell(averageBy(results, result => result.quantitative.format_valid))}\n`;
+  }
+  report += `- Cases with at least one miss: ${missCases} / ${results.length}\n`;
+  report += `- Field-level misses: ${missRows.length}\n\n`;
+
+  report += `## Misses\n\n`;
+  if (meta.fields.length === 0) {
+    report += `No scored fields on this run.\n\n`;
+  } else if (missRows.length === 0) {
+    report += `No field mismatches.\n\n`;
+  } else {
+    report += markdownTable(fieldTableHeaders(meta), missRows);
+    report += `\n`;
   }
 
-  // Calculate average metrics for each model
-  const modelAverages = Object.entries(modelGroups).reduce((acc, [model, quantitative]) => {
-    const count = quantitative.length;
-    const sums = quantitative.reduce((sum, item) => {
-      sum.overall += item.overall;
-      sum.accuracy += item.accuracy;
-      sum.completeness += item.completeness;
-      sum.relevance += item.relevance;
-      return sum;
-    }, { overall: 0, accuracy: 0, completeness: 0, relevance: 0 });
-
-    acc[model] = {
-      overall: sums.overall / count,
-      accuracy: sums.accuracy / count,
-      completeness: sums.completeness / count,
-      relevance: sums.relevance / count
-    };
-
-    return acc;
-  }, Object.create(null));
-
-  // Create model comparison table
-  report += `| Model | Overall Score | Accuracy | Completeness | Relevance |\n`;
-  report += `|-------|--------------|----------|--------------|-----------|\n`;
-
-  for (const [model, metrics] of Object.entries(modelAverages)) {
-    report += `| ${model} | ${metrics.overall.toFixed(CSV_FORMAT.FRACTION_DIGITS)} | ${metrics.accuracy.toFixed(CSV_FORMAT.FRACTION_DIGITS)} | ${metrics.completeness.toFixed(CSV_FORMAT.FRACTION_DIGITS)} | ${metrics.relevance.toFixed(CSV_FORMAT.FRACTION_DIGITS)} |\n`;
+  if (meta.fields.length > 0) {
+    report += `## Fields\n\n`;
+    report += markdownTable(fieldTableHeaders(meta), allRows);
+    report += `\n`;
   }
 
-  // Prompt comparison
-  report += `\n## Prompt Comparison\n\n`;
+  const resultsByModel = groupBy(results, result => result.model);
+  report += `## By model\n\n`;
+  report += markdownTable(
+    scoreHeaders(['Model'], meta),
+    Object.entries(resultsByModel).map(([model, modelResults]) => [model, ...scoreCells(modelResults, meta)])
+  );
 
-  // Group results by prompt type and name
-  const promptGroups = {};
-  for (const result of results) {
-    // Create a display key that shows all prompt types used
-    let displayKey = '';
-
-    if (result.input_system_prompt) {
-      displayKey += `System: ${result.input_system_prompt} `;
-    }
-
-    if (result.input_user_prompt) {
-      displayKey += `User: ${result.input_user_prompt} `;
-    }
-
-    if (result.input_assistant_prompt) {
-      displayKey += `Assistant: ${result.input_assistant_prompt}`;
-    }
-
-    // If no specific prompts found, use the original input_user_prompt
-    if (!displayKey) {
-      displayKey = `Legacy: ${result.input_user_prompt}`;
-    }
-
-    // Initialize group if needed
-    if (!promptGroups[displayKey]) {
-      promptGroups[displayKey] = [];
-    }
-
-    promptGroups[displayKey].push(result.quantitative);
+  if (meta.fields.length > 0) {
+    report += `\n## By field\n\n`;
+    report += markdownTable(
+      ['Field', 'Precision', 'Recall', 'F1', 'Accuracy'],
+      perFieldClassification(results, meta.fields).map(row => [
+        humanizeFieldName(row.name),
+        scoreCell(row.precision),
+        scoreCell(row.recall),
+        scoreCell(row.f1),
+        scoreCell(row.accuracy)
+      ])
+    );
   }
 
-  // Calculate average metrics for each prompt
-  const promptAverages = Object.entries(promptGroups).reduce((acc, [input_user_prompt, quantitative]) => {
-    const count = quantitative.length;
-    const sums = quantitative.reduce((sum, item) => {
-      sum.overall += item.overall;
-      sum.accuracy += item.accuracy;
-      sum.completeness += item.completeness;
-      sum.relevance += item.relevance;
-      return sum;
-    }, { overall: 0, accuracy: 0, completeness: 0, relevance: 0 });
-
-    acc[input_user_prompt] = {
-      overall: sums.overall / count,
-      accuracy: sums.accuracy / count,
-      completeness: sums.completeness / count,
-      relevance: sums.relevance / count
-    };
-
-    return acc;
-  }, Object.create(null));
-
-  // Create prompt comparison table
-  report += `| Prompt | Overall Score | Accuracy | Completeness | Relevance |\n`;
-  report += `|--------|--------------|----------|--------------|-----------|\n`;
-
-  for (const [input_user_prompt, quantitative] of Object.entries(promptAverages)) {
-    report += `| ${input_user_prompt} | ${quantitative.overall.toFixed(2)} | ${quantitative.accuracy.toFixed(2)} | ${quantitative.completeness.toFixed(2)} | ${quantitative.relevance.toFixed(2)} |\n`;
+  if (meta.bucket) {
+    const resultsByBucket = groupBy(results, result => result.quantitative.bucket || 'unlabeled');
+    report += `\n## By bucket\n\n`;
+    report += markdownTable(
+      scoreHeaders(['Bucket', 'Count'], meta),
+      Object.entries(resultsByBucket).map(([bucket, bucketResults]) => [
+        bucket,
+        String(bucketResults.length),
+        ...scoreCells(bucketResults, meta)
+      ])
+    );
   }
 
+  const resultsByPrompt = groupBy(results, result => result.task?.prompt_name || result.prompt_name);
+  report += `\n## By prompt\n\n`;
+  report += markdownTable(
+    scoreHeaders(['Prompt'], meta),
+    Object.entries(resultsByPrompt).map(([prompt, promptResults]) => [prompt, ...scoreCells(promptResults, meta)])
+  );
+
+  report += `\n## Files\n\n`;
+  report += `- \`report.md\` — this file\n`;
+  report += `- \`results.csv\` — all cases, one row each (\`gold_*\` / \`pred_*\` / \`correct_*\`)\n`;
+  report += `- \`metrics.csv\` — one row per model plus \`all\` (Hamming, exact match, macro-F1, Brier)\n`;
+  report += `- \`results.json\` — full records including model JSON\n`;
   return report;
 }
 
-/**
- * Save an individual test result to disk immediately
- * 
- * @param {Object} result - The individual test result to save
- * @returns {Object} - The paths to the saved files
- */
+function writeCsv(results, fieldNames) {
+  let csvContent = getCSVColumnsJoined(fieldNames) + CSV_FORMAT.NEW_LINE;
+  for (const result of results) {
+    const dataMap = getCSVDataMap(result, fieldNames);
+    const rowValues = getCSVColumns(fieldNames).map(field => escapeCSV(dataMap[field]));
+    csvContent += rowValues.join(CSV_FORMAT.COMMA).concat(CSV_FORMAT.NEW_LINE);
+  }
+  return csvContent;
+}
+
 async function saveIndividualResult(result) {
   try {
-    // Create a unique directory for this specific test result
     const resultId = `${result.model}-${result.prompt_name}-${result.input_data_file}`;
     const timestamp = result.timestamp.replace(/[:.]/g, '-');
     const resultDir = path.join(CONFIGURATION.directories.results, 'incremental', `${resultId}_${timestamp}`);
     await ensureDir(resultDir);
 
-    // Save JSON result
     const jsonPath = path.join(resultDir, 'result.json');
     await fs.writeFile(jsonPath, JSON.stringify(result, null, 2));
 
-    // Save a simple markdown summary
+    const q = result.quantitative || {};
+    const fieldNames = resolveFieldNames(result);
+    const fieldTable = fieldNames.length > 0
+      ? markdownTable(
+        ['Field', 'Predicted', 'Gold', 'Match'],
+        fieldNames.map(name => [
+          humanizeFieldName(name),
+          formatPredicted(q.fields, name),
+          formatGold(q.fields, name),
+          formatMatch(q.fields, name)
+        ])
+      )
+      : 'No scored fields.\n';
+
+    const notes = [
+      ...(q.errors || []).map(item => `- ${item}`),
+      ...(result.qualitative?.weaknesses || []).map(item => `- ${item}`),
+      ...(result.qualitative?.suggestions || []).map(item => `- ${item}`)
+    ].join('\n');
+
+    const summary = `# ${result.input?.case || result.input_data_file}
+
+## Task
+
+- Experiment: ${result.task?.experiment || CONFIGURATION.experiment}
+- Model: ${result.model}
+- Prompt: ${result.task?.prompt_name || result.prompt_name}
+
+${result.task?.system ? `**System**\n\n${fence(result.task.system)}\n` : ''}${result.task?.user ? `**User**\n\n${fence(result.task.user)}\n` : ''}## Input
+
+- Case: ${result.input?.case || result.input_data_file}
+- Kind: ${result.input?.kind || result.input_kind || 'N/A'}
+- Files: ${(result.input?.files || []).join(', ') || 'N/A'}
+
+## Fields
+
+${fieldTable}
+## Model response
+
+${fence(JSON.stringify(result.response, null, 2))}
+## Scores
+
+- Miss count: ${fieldMissCount(q.fields)}
+- Format valid: ${q.format_valid !== undefined ? (q.format_valid === 1 ? 'yes' : 'no') : 'N/A'}
+- Hamming accuracy: ${typeof q.hamming_accuracy === 'number' ? q.hamming_accuracy.toFixed(2) : 'N/A'}
+- Exact match: ${typeof q.exact_match === 'number' ? q.exact_match.toFixed(2) : 'N/A'}
+- Stated confidence: ${typeof q.stated_confidence === 'number' ? q.stated_confidence.toFixed(2) : 'N/A'}
+- Brier: ${typeof q.brier === 'number' ? q.brier.toFixed(2) : 'N/A'}
+${q.bucket ? `- Bucket: ${q.bucket}\n` : ''}
+${notes ? `## Notes\n\n${notes}\n` : ''}
+## Timestamp
+
+${result.timestamp}
+`;
     const summaryPath = path.join(resultDir, 'summary.md');
-    const summary = `# Test Result: ${resultId}
-
-    ## Model: ${result.model}
-
-    ## Prompt: ${result.prompt_name} (${result.prompt_type})
-
-    ## Data File: ${result.input_data_file}
-
-    ## Metrics
-    - Overall: ${result.quantitative.overall.toFixed(2)}
-    - Accuracy: ${result.quantitative.accuracy.toFixed(2)}
-    - Completeness: ${result.quantitative.completeness.toFixed(2)}
-    - Relevance: ${result.quantitative.relevance.toFixed(2)}
-
-    ## Timestamp
-    ${result.timestamp}
-    `;
     await fs.writeFile(summaryPath, summary);
 
-    // Save CSV result
     const csvPath = path.join(resultDir, 'result.csv');
-    const headers = getCSVColumnsJoined();
-
-    // Create CSV content with headers and a single row for this result
-    let csvContent = headers + CSV_FORMAT.NEW_LINE;
-
-    // Create a data object that maps header fields to values
-    const dataMap = getCSVDataMap(result);
-
-    // Use the same header fields order to build the row
-    const row = getCSVColumns().map(field => dataMap[field]);
-
-    csvContent += row.map(cell => escapeCSV(cell)).join(CSV_FORMAT.COMMA);
-
-    await fs.writeFile(csvPath, csvContent);
+    await fs.writeFile(csvPath, writeCsv([result], fieldNames));
 
     console.log(`Individual result saved to ${resultDir}`);
     return { resultDir, jsonPath, summaryPath, csvPath };
@@ -592,35 +767,37 @@ async function saveIndividualResult(result) {
   }
 }
 
-/**
- * Save test results to file
- * 
- * @param {Array} results - The test results to save
- * @returns {Object} - The paths to the saved files
- */
 async function saveResults(results) {
   try {
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const runDir = path.join(CONFIGURATION.directories.results, `run_${timestamp}`);
     await ensureDir(runDir);
 
-    // Save JSON results
+    const fieldNames = resolveFieldNames(results);
+
     const jsonPath = path.join(runDir, 'results.json');
     await fs.writeFile(jsonPath, JSON.stringify(results, null, 2));
     console.log(`Results saved to ${jsonPath}`);
 
-    // Generate and save markdown report
     const reportPath = path.join(runDir, 'report.md');
-    const report = generateReport(results);
-    await fs.writeFile(reportPath, report);
+    await fs.writeFile(reportPath, generateReport(results));
     console.log(`Report saved to ${reportPath}`);
 
-    // Export CSV files by model without correlation
-    await exportCsvByModel(results, timestamp, runDir);
+    const collectiveCsvPath = path.join(runDir, 'results.csv');
+    await fs.writeFile(collectiveCsvPath, writeCsv(results, fieldNames), 'utf8');
+    console.log(`Collective CSV saved to ${collectiveCsvPath}`);
+
+    const metricsCsvPath = path.join(runDir, 'metrics.csv');
+    await fs.writeFile(metricsCsvPath, writeMetricsCsv(results, fieldNames), 'utf8');
+    console.log(`Metrics CSV saved to ${metricsCsvPath}`);
+
+    await exportCsvByModel(results, runDir);
 
     return {
       jsonPath,
       reportPath,
+      csvPath: collectiveCsvPath,
+      metricsCsvPath,
       runDir
     };
   } catch (error) {
@@ -629,40 +806,15 @@ async function saveResults(results) {
   }
 }
 
-/**
- * Export results to CSV files organized by model
- * 
- * @param {Array} results - The test results to export
- * @param {string} timestamp - The timestamp for the file names
- * @param {string} runDir - Directory for this test run
- */
-async function exportCsvByModel(results, timestamp, runDir) {
+async function exportCsvByModel(results, runDir) {
   try {
-    const modelGroups = Object.create(null);
+    const fieldNames = resolveFieldNames(results);
+    const modelGroups = groupBy(results, result => result.model);
 
-    for (const result of results) {
-      const { model } = result;
-      if (!modelGroups[model]) {
-        modelGroups[model] = [];
-      }
-      modelGroups[model].push(result);
-    }
-
-    for (const [model, results] of Object.entries(modelGroups)) {
-      let csvContent = getCSVColumnsJoined() + CSV_FORMAT.NEW_LINE;
-
-      for (const result of results) {
-        // Create a data object that maps header fields to values
-        const dataMap = getCSVDataMap(result);
-
-        // Use the same header fields order to build the row
-        const rowValues = getCSVColumns().map(field => escapeCSV(dataMap[field]));
-        csvContent += rowValues.join(CSV_FORMAT.COMMA).concat(CSV_FORMAT.NEW_LINE);
-      }
-
+    for (const [model, modelResults] of Object.entries(modelGroups)) {
       const normalizedModelId = OpenAIAdapter.getModelIdForFilePath(model);
-      const csvFilePath = path.join(runDir, `${normalizedModelId}_results_${timestamp}.csv`);
-      await fs.writeFile(csvFilePath, csvContent, 'utf8');
+      const csvFilePath = path.join(runDir, `${normalizedModelId}_results.csv`);
+      await fs.writeFile(csvFilePath, writeCsv(modelResults, fieldNames), 'utf8');
       console.log(`Exported CSV for model ${model} to ${csvFilePath}`);
     }
   } catch (error) {
@@ -670,20 +822,9 @@ async function exportCsvByModel(results, timestamp, runDir) {
   }
 }
 
-/**
- * Main function to run the tests
- * 
- * Key implementation details:
- * - Loads available models from the server and filters based on configuration
- * - Loads prompts (system, user, assistant) and data files from directories
- * - Only evaluates user prompts and legacy prompts, skips system and assistant prompts
- * - Executes prompts with models and evaluates responses
- * - Correlates matching system, user, and assistant prompts based on base name
- * - Generates reports and exports results to CSV files
- * - Implements request timeout controlled by REQUEST_TIMEOUT_MS environment variable
- */
 async function runTests() {
   try {
+    console.log(`Experiment: ${CONFIGURATION.experiment} (${CONFIGURATION.directories.root})`);
     console.log('Starting tests...');
 
     await ensureDir(CONFIGURATION.directories.results);
@@ -716,47 +857,41 @@ async function runTests() {
     console.log(`Loaded ${Object.keys(prompts).length} prompts and ${Object.keys(data).length} data.`);
 
     const results = [];
-    const evaluationOptions = {
-      expectedFields: [
-        { alternateNames: ['main_points', 'mainPoints', 'key_points', 'keyPoints'], description: 'key points' },
-        { alternateNames: ['summary', 'overview'], description: 'summary' },
-        { alternateNames: ['analysis', 'evaluation'], description: 'analysis' },
-        { alternateNames: ['recommendations', 'suggestions'], description: 'recommendations' },
-        { alternateNames: ['details', 'specifics'], description: 'details' }
-      ],
-      relevantTerms: ['analysis', 'file', 'text', 'content', 'information', 'important', 'key', 'critical']
-    };
+    const evaluationOptions = {};
 
-    // Create a function to process a single test case
     async function processTestCase(model, input_user_prompt, promptContent, input_data_file, documentContent, testId = 'N/A') {
       const displayName = promptContent.type !== 'legacy' ?
         `${promptContent.type}_${promptContent.name}` : input_user_prompt;
 
-      // Clear visual separator for test start
       console.log(`\n\n${'='.repeat(50)}`);
-      console.log(`🧪 TEST ${testId} - STARTED`);
+      console.log(`TEST ${testId} - STARTED`);
       console.log(`${'='.repeat(50)}`);
-      console.log(`📋 Test Details:`);
-      console.log(`  • Model: ${model}`);
-      console.log(`  • Prompt: ${displayName} (${promptContent.type} type)`);
-      console.log(`  • File: ${input_data_file}`);
+      console.log(`Test details:`);
+      console.log(`  - Model: ${model}`);
+      console.log(`  - Prompt: ${displayName} (${promptContent.type} type)`);
+      console.log(`  - File: ${input_data_file}`);
+      if (documentContent?.images?.length) {
+        console.log(`  - Images: ${documentContent.images.map(img => img.filename).join(', ')}`);
+      }
       console.log(`${'─'.repeat(50)}`);
 
-      // Start timing the entire test case processing
       const testStartTime = Date.now();
 
       try {
-        console.log(`⏳ Executing prompt...`);
+        console.log(`Executing prompt...`);
         const response = await executePrompt(model, promptContent, documentContent, input_user_prompt, prompts);
         
-        console.log(`🔍 Parsing response...`);
+        console.log(`Parsing response...`);
         const parsedResponse = await parseJsonFromResponse(response);
         
-        console.log(`📝 Evaluating response...`);
-        const evaluation = await evaluateResponse(parsedResponse, evaluationOptions);
+        console.log(`Evaluating response...`);
+        const evaluation = await evaluateResponse(parsedResponse, {
+          ...evaluationOptions,
+          input_data_file,
+        });
 
         if (!evaluation) {
-          console.error(`❌ Error: Failed to evaluate response for model ${model}, prompt ${input_user_prompt}, file ${input_data_file}.`);
+          console.error(`Error: Failed to evaluate response for model ${model}, prompt ${input_user_prompt}, file ${input_data_file}.`);
           return null;
         }
 
@@ -764,18 +899,27 @@ async function runTests() {
         let input_system_prompt = null;
         let input_assistant_prompt = null;
 
-        // Calculate total processing time
         const testEndTime = Date.now();
         const processingTimeMs = testEndTime - testStartTime;
         const formattedProcessingTime = formatProcessingTime(processingTimeMs);
 
         console.log(`\n${'─'.repeat(50)}`);
-        console.log(`✅ TEST ${testId} - COMPLETED in ${formattedProcessingTime}`);
-        console.log(`📊 Scores:`);
-        console.log(`  • Overall: ${quantitative.overall.toFixed(CSV_FORMAT.FRACTION_DIGITS)}`);
-        console.log(`  • Accuracy: ${quantitative.accuracy.toFixed(CSV_FORMAT.FRACTION_DIGITS)}`);
-        console.log(`  • Completeness: ${quantitative.completeness.toFixed(CSV_FORMAT.FRACTION_DIGITS)}`);
-        console.log(`  • Relevance: ${quantitative.relevance.toFixed(CSV_FORMAT.FRACTION_DIGITS)}`);
+        console.log(`TEST ${testId} - COMPLETED in ${formattedProcessingTime}`);
+        console.log(`Scores:`);
+        console.log(`  - Hamming accuracy: ${scoreCell(quantitative.hamming_accuracy)}`);
+        console.log(`  - Exact match: ${scoreCell(quantitative.exact_match)}`);
+        if (quantitative.format_valid !== undefined) {
+          console.log(`  - Format valid: ${scoreCell(quantitative.format_valid)}`);
+          if (quantitative.bucket) {
+            console.log(`  - Bucket: ${quantitative.bucket}`);
+          }
+        }
+        if (quantitative.fields) {
+          console.log(`Fields:`);
+          for (const name of Object.keys(quantitative.fields)) {
+            console.log(`  - ${humanizeFieldName(name)}: predicted=${formatPredicted(quantitative.fields, name)} gold=${formatGold(quantitative.fields, name)} match=${formatMatch(quantitative.fields, name)}`);
+          }
+        }
         console.log(`${'='.repeat(50)}`);
 
         const baseName = promptContent.name;
@@ -792,13 +936,11 @@ async function runTests() {
             }
           }
 
-          // Store any system prompt as potential fallback
           if (otherPrompt.type === 'system' && !fallbackSystemPrompt) {
             fallbackSystemPrompt = otherPromptFile;
           }
         }
 
-        // If no matching system prompt was found, use the fallback
         if (!foundMatchingSystem && fallbackSystemPrompt) {
           input_system_prompt = fallbackSystemPrompt;
           console.log(`No matching system prompt found for ${input_user_prompt}, using fallback: ${fallbackSystemPrompt}`);
@@ -808,51 +950,49 @@ async function runTests() {
           id: `${model}-${input_user_prompt}-${input_data_file}`,
           timestamp: new Date().toISOString(),
           model,
+          task: buildTask(prompts, promptContent),
+          input: buildInput(input_data_file, documentContent),
           input_user_prompt: promptContent.type === 'user' ? input_user_prompt : null,
           input_system_prompt,
           input_assistant_prompt,
           prompt_type: promptContent.type,
           prompt_name: promptContent.name,
           input_data_file,
+          input_kind: inputKind(documentContent),
           quantitative,
           qualitative,
           response: parsedResponse,
-          processing_time: formattedProcessingTime
+          processing_time: processingTimeMs
         };
 
-        // Write individual result to disk immediately
         await saveIndividualResult(result);
 
         return result;
       } catch (error) {
-        // Extract the most useful part of the error message
         let errorMessage = 'Unknown error';
         if (error.cause && error.cause.code) {
           errorMessage = `${error.cause.code}`;
         } else if (error.message) {
-          // Limit error message length for readability
-          errorMessage = error.message.length > 100 ? 
+          errorMessage = error.message.length > 100 ?
             `${error.message.substring(0, 100)}...` : error.message;
         }
-        
-        // Format error output with clear visual indicators
+
         console.log(`\n${'─'.repeat(50)}`);
-        console.log(`❌ TEST ${testId} - FAILED`);
-        console.log(`🚨 Error details:`);
-        console.log(`  • Model: ${model}`);
-        console.log(`  • Prompt: ${input_user_prompt}`);
-        console.log(`  • File: ${input_data_file}`);
-        console.log(`  • Error: ${errorMessage}`);
+        console.log(`TEST ${testId} - FAILED`);
+        console.log(`Error details:`);
+        console.log(`  - Model: ${model}`);
+        console.log(`  - Prompt: ${input_user_prompt}`);
+        console.log(`  - File: ${input_data_file}`);
+        console.log(`  - Error: ${errorMessage}`);
         console.log(`${'='.repeat(50)}`);
         return null;
       }
     }
 
-    // Generate all test cases
     const testCases = modelsToTest.reduce((acc, model) => {
       const modelCases = Object.entries(prompts).reduce((promptAcc, [input_user_prompt, promptContent]) => {
         if (promptContent.type === 'system' || promptContent.type === 'assistant') {
-          console.log(`Skipping evaluation for ${promptContent.type} prompt: ${input_user_prompt} (will be correlated with user prompts)`);
+          console.log(`Skipping ${promptContent.type} prompt: ${input_user_prompt} (paired with user prompts)`);
           return promptAcc;
         }
 
@@ -870,15 +1010,11 @@ async function runTests() {
       return acc.concat(modelCases);
     }, []);
 
-    // No sampling - using all test cases
     console.log(`Running all ${testCases.length} test cases`);
 
-
-    // Get concurrency limit from environment or use default
     const concurrencyLimit = parseInt(process.env.CONCURRENCY_LIMIT || '3', 10);
     console.log(`Running tests with concurrency limit: ${concurrencyLimit}`);
 
-    // Group test cases by model
     const testCasesByModel = Object.create(null);
     for (const testCase of testCases) {
       if (!testCasesByModel[testCase.model]) {
@@ -887,7 +1023,6 @@ async function runTests() {
       testCasesByModel[testCase.model].push(testCase);
     }
 
-    // Process test cases for a single model in parallel with concurrency limit
     const processModelTestCases = async (modelTestCases, limit, globalTestCounter) => {
       const results = [];
       const inProgress = new Set();
@@ -896,12 +1031,10 @@ async function runTests() {
         const testCase = modelTestCases[i];
         const testId = `${globalTestCounter.current}/${testCases.length}`;
         globalTestCounter.current++;
-        // Wait if we've reached the concurrency limit
         while (inProgress.size >= limit) {
           await Promise.race(inProgress);
         }
 
-        // Process the next test case
         const promise = processTestCase(
           testCase.model,
           testCase.input_user_prompt,
@@ -917,19 +1050,17 @@ async function runTests() {
         inProgress.add(promise);
       }
 
-      // Wait for any remaining tasks
       await Promise.all(inProgress);
       return results;
     };
 
-    // Process models sequentially, but prompt-data combinations in parallel
     const allResults = [];
     const modelEntries = Object.entries(testCasesByModel);
     const totalModels = modelEntries.length;
-    const globalTestCounter = { current: 1 }; // Track global test progress
-    
+    const globalTestCounter = { current: 1 };
+
     console.log(`\n${'='.repeat(60)}`);
-    console.log(`🔍 STARTING TEST EXECUTION - ${testCases.length} total test cases across ${totalModels} models`);
+    console.log(`STARTING TEST EXECUTION - ${testCases.length} total test cases across ${totalModels} models`);
     console.log(`${'='.repeat(60)}`);
     
     for (let i = 0; i < modelEntries.length; i++) {
@@ -937,17 +1068,17 @@ async function runTests() {
       const modelProgress = `(${i + 1}/${totalModels})`;
       
       console.log(`\n${'─'.repeat(60)}`);
-      console.log(`📦 Processing model ${modelProgress}: ${model}`);
-      console.log(`📋 Test cases: ${modelTestCases.length}`);
-      console.log(`⏳ Estimated time: ~${Math.round(modelTestCases.length * 5 / concurrencyLimit)} minutes`);
+      console.log(`Processing model ${modelProgress}: ${model}`);
+      console.log(`Test cases: ${modelTestCases.length}`);
+      console.log(`Estimated time: ~${Math.round(modelTestCases.length * 5 / concurrencyLimit)} minutes`);
       console.log(`${'─'.repeat(60)}`);
       
       const startTime = Date.now();
       const modelResults = await processModelTestCases(modelTestCases, concurrencyLimit, globalTestCounter);
       const elapsedTime = ((Date.now() - startTime) / 1000 / 60).toFixed(2);
       
-      console.log(`\n✅ Model ${model} completed in ${elapsedTime} minutes`);
-      console.log(`📊 Results: ${modelResults.length}/${modelTestCases.length} tests passed`);
+      console.log(`\nModel ${model} completed in ${elapsedTime} minutes`);
+      console.log(`Results: ${modelResults.length}/${modelTestCases.length} tests passed`);
       
       allResults.push(...modelResults);
     }
@@ -958,59 +1089,45 @@ async function runTests() {
       const saveInfo = await saveResults(results);
       
       console.log(`\n${'='.repeat(60)}`);
-      console.log(`📊 TEST EXECUTION SUMMARY`);
+      console.log(`TEST EXECUTION SUMMARY`);
       console.log(`${'='.repeat(60)}`);
       
       const totalTests = testCases.length;
       const successfulTests = results.length;
       const failedTests = totalTests - successfulTests;
+      const fieldNames = resolveFieldNames(results);
+      const hamming = meanHamming(results);
+      const exact = meanExactMatch(results);
+      const macroF1 = macroF1FromResults(results, fieldNames);
+      const formatValid = averageBy(results, result => result.quantitative.format_valid);
+
+      console.log(`Test statistics:`);
+      console.log(`  - Total Tests: ${totalTests}`);
+      console.log(`  - Successful: ${successfulTests} (${Math.round(successfulTests/totalTests*100)}%)`);
+      console.log(`  - Failed: ${failedTests} (${Math.round(failedTests/totalTests*100)}%)`);
+
+      console.log(`\nAverage scores:`);
+      console.log(`  - Hamming accuracy: ${scoreCell(hamming)}`);
+      console.log(`  - Exact match: ${scoreCell(exact)}`);
+      console.log(`  - Macro-F1: ${scoreCell(macroF1)}`);
+      console.log(`  - Brier: ${scoreCell(averageBy(results, result => result.quantitative?.brier))}`);
+      console.log(`  - Stated confidence: ${scoreCell(averageBy(results, result => result.quantitative?.stated_confidence))}`);
+      if (detectReportMeta(results).format_valid) {
+        console.log(`  - Format valid: ${scoreCell(formatValid)}`);
+      }
       
-      const avgScores = {
-        overall: 0,
-        accuracy: 0,
-        completeness: 0,
-        relevance: 0
-      };
-      
-      results.forEach(result => {
-        avgScores.overall += result.quantitative.overall;
-        avgScores.accuracy += result.quantitative.accuracy;
-        avgScores.completeness += result.quantitative.completeness;
-        avgScores.relevance += result.quantitative.relevance;
-      });
-      
-      Object.keys(avgScores).forEach(key => {
-        avgScores[key] = (avgScores[key] / successfulTests).toFixed(CSV_FORMAT.FRACTION_DIGITS);
-      });
-      
-      console.log(`📊 Test Statistics:`);
-      console.log(`  • Total Tests: ${totalTests}`);
-      console.log(`  • Successful: ${successfulTests} (${Math.round(successfulTests/totalTests*100)}%)`);
-      console.log(`  • Failed: ${failedTests} (${Math.round(failedTests/totalTests*100)}%)`);
-      
-      console.log(`\n📊 Average Scores:`);
-      console.log(`  • Overall: ${avgScores.overall}`);
-      console.log(`  • Accuracy: ${avgScores.accuracy}`);
-      console.log(`  • Completeness: ${avgScores.completeness}`);
-      console.log(`  • Relevance: ${avgScores.relevance}`);
-      
-      console.log(`\n✅ Tests completed successfully!`);
+      console.log(`\nTests completed successfully!`);
       console.log(`${'='.repeat(60)}`);
       
       try {
         const runDir = saveInfo.runDir;
-        const files = await fs.readdir(runDir);
         let csvContent = '';
-        
-        const csvFile = files.find(file => file.endsWith('.csv'));
-        if (csvFile) {
-          const csvPath = path.join(runDir, csvFile);
-          try {
-            csvContent = await fs.readFile(csvPath, 'utf8');
-            console.log(`Found CSV file for Slack webhook: ${csvPath}`);
-          } catch (err) {
-            console.warn(`Could not read CSV file ${csvPath} for Slack webhook:`, err.message);
-          }
+        const metricsPath = saveInfo.metricsCsvPath || path.join(runDir, 'metrics.csv');
+        try {
+          csvContent = await fs.readFile(metricsPath, 'utf8');
+          console.log(`Found metrics CSV for Slack webhook: ${metricsPath}`);
+        } catch (err) {
+          console.warn(`Could not read metrics CSV ${metricsPath} for Slack webhook:`, err.message);
         }
         
         const testSummary = {
@@ -1018,10 +1135,10 @@ async function runTests() {
           successful: successfulTests,
           failed: failedTests,
           averageScores: {
-            overall: parseFloat(avgScores.overall),
-            accuracy: parseFloat(avgScores.accuracy),
-            completeness: parseFloat(avgScores.completeness),
-            relevance: parseFloat(avgScores.relevance)
+            hamming_accuracy: hamming,
+            exact_match: exact,
+            macro_f1: macroF1,
+            format_valid: formatValid
           }
         };
         
@@ -1031,11 +1148,11 @@ async function runTests() {
         console.error('Error sending test results to Slack:', slackError);
       }
     } else {
-      console.error('\n❌ No test results were generated.');
+      console.error('\nNo test results were generated.');
     }
   } catch (error) {
     console.log(`\n${'='.repeat(60)}`);
-    console.log(`❌ TEST EXECUTION FAILED`);
+    console.log(`TEST EXECUTION FAILED`);
     console.log(`${'='.repeat(60)}`);
     
     let errorMessage = 'Unknown error';
@@ -1045,19 +1162,19 @@ async function runTests() {
       errorMessage = error.message;
     }
     
-    console.log(`🚨 Error details:`);
-    console.log(`  • Error: ${errorMessage}`);
+    console.log(`Error details:`);
+    console.log(`  - Error: ${errorMessage}`);
     
     if (errorMessage.includes('ECONNREFUSED') || errorMessage.includes('ETIMEDOUT')) {
-      console.log(`\n🔧 Troubleshooting suggestions:`);
-      console.log(`  • Check if the model server is running at ${CONFIGURATION.modelServer.url}`);
-      console.log(`  • Verify network connectivity to the model server`);
-      console.log(`  • Consider increasing the request timeout in the environment variables`);
+      console.log(`\nTroubleshooting:`);
+      console.log(`  - Check if the model server is running at ${CONFIGURATION.modelServer.url}`);
+      console.log(`  - Verify network connectivity to the model server`);
+      console.log(`  - Consider increasing the request timeout in the environment variables`);
     } else if (errorMessage.includes('HeadersTimeoutError')) {
-      console.log(`\n🔧 Troubleshooting suggestions:`);
-      console.log(`  • The server took too long to respond. Try increasing the REQUEST_TIMEOUT_MS value in .env`);
-      console.log(`  • Current timeout: ${process.env.REQUEST_TIMEOUT_MS || 'default'} ms`);
-      console.log(`  • Consider reducing concurrency with CONCURRENCY_LIMIT in .env`);
+      console.log(`\nTroubleshooting:`);
+      console.log(`  - The server took too long to respond. Try increasing the REQUEST_TIMEOUT_MS value in .env`);
+      console.log(`  - Current timeout: ${process.env.REQUEST_TIMEOUT_MS || 'default'} ms`);
+      console.log(`  - Consider reducing concurrency with CONCURRENCY_LIMIT in .env`);
     }
     
     console.log(`${'='.repeat(60)}`);
@@ -1077,5 +1194,8 @@ async function runTests() {
   }
 }
 
-// Run the tests
-runTests().catch(console.error);
+export { generateReport, writeCsv };
+
+if (path.resolve(process.argv[1] || '') === fileURLToPath(import.meta.url)) {
+  runTests().catch(console.error);
+}

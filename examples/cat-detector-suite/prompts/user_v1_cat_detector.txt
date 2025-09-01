@@ -1,0 +1,5 @@
+Classify the attached image(s). Return only JSON in this shape:
+
+{"domestic_cat":false,"person":false,"wildlife_felid":false,"contains_manmade_object":false,"stated_confidence":0.0}
+
+No markdown, no extra keys, no commentary.
