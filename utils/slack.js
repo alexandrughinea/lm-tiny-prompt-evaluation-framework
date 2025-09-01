@@ -28,8 +28,9 @@ import axios from 'axios';
  * }>} blocks - Message blocks for Slack API
  */
 
-// Maximum Slack message payload size (30KB)
-const MAX_PAYLOAD_SIZE = 30 * 1024;
+// Slack has a 40,000 character limit - use much safer limits
+const MAX_PAYLOAD_SIZE = 35 * 1024; // 35KB total (safe margin from 40K limit)
+const MAX_CSV_PREVIEW_SIZE = 3 * 1024; // Reserve only 3KB for CSV preview
 
 // Using direct console.warn instead of custom function
 
@@ -42,27 +43,38 @@ const MAX_PAYLOAD_SIZE = 30 * 1024;
 function createCsvPreview(csvContent) {
   const header = '```\n'; // code block start
   const footer = '\n```'; // code block end
-  const maxCsvLength = MAX_PAYLOAD_SIZE - Buffer.byteLength(header + footer, 'utf8');
-  let preview = csvContent;
-  const buffer = Buffer.from(preview, 'utf8');
+  const truncationNote = '\n... [truncated]';
+  const maxCsvLength = MAX_CSV_PREVIEW_SIZE - Buffer.byteLength(header + footer + truncationNote, 'utf8');
+  
+  const lines = csvContent.split('\n');
+  let truncated = '';
+  let totalBytes = 0;
 
-  if (buffer.length > maxCsvLength) {
-    // Truncate without cutting a line in half
-    const lines = csvContent.split('\n');
-    let truncated = '';
-    let totalBytes = 0;
-
-    for (const line of lines) {
-      const lineBytes = Buffer.byteLength(line + '\n', 'utf8');
-      if (totalBytes + lineBytes > maxCsvLength) break;
-      truncated += line + '\n';
-      totalBytes += lineBytes;
+  // Always include header line if it exists
+  if (lines.length > 0) {
+    const headerLine = lines[0] + '\n';
+    const headerBytes = Buffer.byteLength(headerLine, 'utf8');
+    if (headerBytes <= maxCsvLength) {
+      truncated += headerLine;
+      totalBytes += headerBytes;
     }
-
-    preview = truncated.trimEnd() + '\n... [truncated]';
   }
 
-  return header + preview + footer;
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.trim()) continue; // Skip empty lines
+    
+    const lineBytes = Buffer.byteLength(line + '\n', 'utf8');
+    if (totalBytes + lineBytes > maxCsvLength) break;
+    truncated += line + '\n';
+    totalBytes += lineBytes;
+  }
+
+  if (lines.length > 1 && truncated.split('\n').length - 1 < lines.length) {
+    truncated = truncated.trimEnd() + truncationNote;
+  }
+
+  return header + truncated + footer;
 }
 
 /**

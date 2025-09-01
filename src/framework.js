@@ -817,7 +817,7 @@ async function runTests() {
           quantitative,
           qualitative,
           response: parsedResponse,
-          processing_time: formattedProcessingTime
+          processing_time: processingTimeMs
         };
 
         // Write individual result to disk immediately
