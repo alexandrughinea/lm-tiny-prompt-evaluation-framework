@@ -12,11 +12,15 @@ export default class OpenAIAdapter {
     this.authUsername = process.env.AUTH_USERNAME;
     this.authPassword = process.env.AUTH_PASSWORD;
     this.authHeader = null;
-    
-    if (this.authUsername && this.authPassword) {
+
+    const apiKey = (process.env.API_KEY || '').trim();
+    if (apiKey) {
+      this.authHeader = `Bearer ${apiKey}`;
+      console.log('OpenAIAdapter using Bearer API key');
+    } else if (this.authUsername && this.authPassword) {
       const credentials = Buffer.from(`${this.authUsername}:${this.authPassword}`).toString('base64');
       this.authHeader = `Basic ${credentials}`;
-      console.log('OpenAIAdapter initialized with basic authentication');
+      console.log('OpenAIAdapter using basic authentication');
     }
 
     console.log(`OpenAIAdapter initialized with model: ${this.model}, max_tokens: ${this.max_tokens}`);

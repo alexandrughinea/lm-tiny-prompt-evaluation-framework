@@ -10,7 +10,7 @@ Score a **prompt × model × case** grid against gold labels. Each run writes a 
   - `MODEL_SERVER_URL`
   - `INPUT_EXPERIMENT=cat-detector-suite` (folder name under `examples/` or `inputs/`)
 
-Optional: `DEFAULT_MODELS`, Slack webhook. Suite-specific settings (`temperature`, schema, token cap, models) live in `{suite}/config.json` and override env.
+Optional: `API_KEY` for `Authorization: Bearer` on `/v1` (Groq, Together, OpenAI, vLLM `--api-key`, LM Studio with a key). Omit for local servers with no key. Also optional: `DEFAULT_MODELS`, Slack webhook. Suite-specific settings (`temperature`, schema, token cap, models) live in `{suite}/config.json` and override env.
 
 Shipped suites live in `examples/`. Your own suites go in `inputs/` under a **different** name — the runner does not treat `inputs/{name}` as an override of `examples/{name}`.
 
