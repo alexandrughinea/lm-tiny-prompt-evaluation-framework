@@ -1,7 +1,12 @@
 import fs from 'fs/promises';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { CONFIGURATION } from './config.js';
-import { brierScore, exactFieldMatch, meanFieldMatch, parseConfidence } from '../utils/report-utils.js';
+import { brierScore, calibrationMse, exactFieldMatch, meanFieldMatch, parseConfidence } from '../utils/report-utils.js';
+import { loadFieldNames } from '../evaluators/labels.js';
+import { isPlainObject, rewriteRecordKeys } from '../utils/label-normalize.js';
+
+const PROJECT_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 /**
  * @typedef {object} QuantitativeResult
@@ -11,8 +16,10 @@ import { brierScore, exactFieldMatch, meanFieldMatch, parseConfidence } from '..
  * @property {string[]} [errors]
  * @property {number|null} [hamming_accuracy]
  * @property {number|null} [exact_match]
- * @property {number|null} [stated_confidence]
- * @property {number|null} [brier]
+ * @property {number|null} [confidence_exact]
+ * @property {number|null} [confidence_hamming]
+ * @property {number|null} [brier_exact]
+ * @property {number|null} [calibration_mse]
  */
 
 /**
@@ -23,27 +30,30 @@ import { brierScore, exactFieldMatch, meanFieldMatch, parseConfidence } from '..
  */
 
 async function loadCustomEvaluator(type) {
-  try {
-    const evaluatorPath = path.join(CONFIGURATION.directories.evaluators, `${type}.js`);
+  const functionName = type === 'quantitative' ? 'evaluateQuantitative' : 'evaluateQualitative';
+  const candidates = [
+    path.join(CONFIGURATION.directories.evaluators, `${type}.js`),
+    path.join(PROJECT_ROOT, 'evaluators', `${type}.js`)
+  ];
 
+  for (const evaluatorPath of candidates) {
     try {
       await fs.access(evaluatorPath);
     } catch {
-      return null;
+      continue;
     }
 
-    const evaluatorModule = await import(`file://${evaluatorPath}`);
-    const functionName = type === 'quantitative' ? 'evaluateQuantitative' : 'evaluateQualitative';
-
-    if (evaluatorModule && typeof evaluatorModule[functionName] === 'function') {
-      return evaluatorModule[functionName];
+    try {
+      const evaluatorModule = await import(`file://${evaluatorPath}`);
+      if (evaluatorModule && typeof evaluatorModule[functionName] === 'function') {
+        return evaluatorModule[functionName];
+      }
+    } catch (error) {
+      console.error(`Error loading ${type} evaluator from ${evaluatorPath}:`, error);
     }
-
-    return null;
-  } catch (error) {
-    console.error(`Error loading ${type} evaluator:`, error);
-    return null;
   }
+
+  return null;
 }
 
 function asFormatValid(value) {
@@ -57,7 +67,8 @@ function asFormatValid(value) {
 }
 
 /**
- * Run suite evaluators, then attach Hamming accuracy, exact match, and Brier from `fields` / `stated_confidence`.
+ * Run suite evaluators, then attach Hamming, exact match, brier_exact, and calibration_mse.
+ * Confidence comes from harness self-consistency (`options.confidence_exact` / `confidence_hamming`), not from the model JSON.
  *
  * Suite `evaluateQuantitative(parsed, { input_data_file })` should return
  * `{ fields, format_valid?, bucket?, errors }`.
@@ -77,6 +88,10 @@ export async function evaluate(result, options = {}) {
     }
   }
 
+  if (isPlainObject(parsedResult)) {
+    parsedResult = rewriteRecordKeys(parsedResult, loadFieldNames());
+  }
+
   const customQuantitative = await loadCustomEvaluator('quantitative');
   const customQualitative = await loadCustomEvaluator('qualitative');
 
@@ -85,18 +100,26 @@ export async function evaluate(result, options = {}) {
     quantitativeEvaluation();
 
   const exactMatch = exactFieldMatch(quantitative.fields);
-  const statedConfidence = parseConfidence(parsedResult?.stated_confidence);
+  const confidenceExact = parseConfidence(options.confidence_exact);
+  const confidenceHamming = parseConfidence(options.confidence_hamming);
   quantitative = {
     ...quantitative,
     hamming_accuracy: meanFieldMatch(quantitative.fields),
     exact_match: exactMatch,
     errors: quantitative.errors || []
   };
-  if (statedConfidence !== null) {
-    quantitative.stated_confidence = statedConfidence;
-    const brier = brierScore(statedConfidence, exactMatch);
-    if (brier !== null) {
-      quantitative.brier = brier;
+  if (confidenceExact !== null) {
+    quantitative.confidence_exact = confidenceExact;
+    const exactBrier = brierScore(confidenceExact, exactMatch);
+    if (exactBrier !== null) {
+      quantitative.brier_exact = exactBrier;
+    }
+  }
+  if (confidenceHamming !== null) {
+    quantitative.confidence_hamming = confidenceHamming;
+    const mse = calibrationMse(confidenceHamming, quantitative.hamming_accuracy);
+    if (mse !== null) {
+      quantitative.calibration_mse = mse;
     }
   }
 

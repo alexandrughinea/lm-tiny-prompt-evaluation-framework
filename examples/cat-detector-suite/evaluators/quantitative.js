@@ -5,10 +5,6 @@ function isBoolean(value) {
   return typeof value === 'boolean';
 }
 
-function isConfidence(value) {
-  return typeof value === 'number' && !Number.isNaN(value) && value >= 0 && value <= 1;
-}
-
 function emptyFieldScores() {
   return Object.fromEntries(BOOLEAN_FIELDS.map(field => [field, {
     predicted: null,
@@ -50,7 +46,6 @@ export function evaluateQuantitative(result, options = {}) {
 
     const schemaChecks = [
       ...BOOLEAN_FIELDS.map(field => isBoolean(result[field])),
-      isConfidence(result.stated_confidence),
       exactKeySet
     ];
 
@@ -64,9 +59,6 @@ export function evaluateQuantitative(result, options = {}) {
       if (Object.hasOwn(result, field) && !isBoolean(result[field])) {
         metrics.errors.push(`${field} must be a boolean`);
       }
-    }
-    if (Object.hasOwn(result, 'stated_confidence') && !isConfidence(result.stated_confidence)) {
-      metrics.errors.push('stated_confidence must be a number between 0 and 1');
     }
 
     const brokeBothFelids = result.domestic_cat === true && result.wildlife_felid === true;

@@ -7,40 +7,39 @@ import OpenAIAdapter from './adapters/openai.js';
 import {ensureDir} from '../utils/file-utils.js';
 import {CSV_FORMAT, escapeCSV, getCSVColumns, getCSVColumnsJoined, getCSVDataMap, formatProcessingTime, writeMetricsCsv} from '../utils/csv-utils.js';
 import { detectReportMeta, fieldMatchScore, fieldMissCount, formatGold, formatMatch, formatPredicted, humanizeFieldName, macroF1FromResults, markdownTable, perFieldClassification, resolveFieldNames } from '../utils/report-utils.js';
+import { selfConsistency } from '../utils/consistency.js';
+import { loadFieldNames } from '../evaluators/labels.js';
 import {generateCacheKey, getFromCache, saveToCache} from '../utils/cache-utils.js';
 import { sendTestResultsToSlack, sendErrorToSlack } from '../utils/slack.js';
-import { isImageExtension, loadSidecarImages, loadStandaloneImageCases, toDataUrl } from '../utils/media-utils.js';
+import { isImageExtension, loadSidecarImages, loadStandaloneImageCases, toChatImageUrl } from '../utils/media-utils.js';
+import { indexTextFiles, isTextExtension } from '../utils/text-files.js';
 
-/** Load `.txt` prompts and tag them as system, user, assistant, or legacy. */
+/** Load `.txt` / `.md` prompts and tag them as system, user, assistant, or legacy. */
 async function loadPrompts() {
   try {
     const promptFiles = await fs.readdir(CONFIGURATION.directories.prompts);
     const prompts = Object.create(null);
-    const extension = '.txt'
 
-    for (const file of promptFiles) {
-      if (path.extname(file) === extension) {
-        const input_user_prompt = path.basename(file, extension);
-        const promptPath = path.join(CONFIGURATION.directories.prompts, file);
-        const promptContent = await fs.readFile(promptPath, 'utf8');
+    for (const [input_user_prompt, file] of indexTextFiles(promptFiles)) {
+      const promptPath = path.join(CONFIGURATION.directories.prompts, file);
+      const promptContent = await fs.readFile(promptPath, 'utf8');
 
-        let promptType = 'legacy';
-        if (input_user_prompt.startsWith('system_')) {
-          promptType = 'system';
-        } else if (input_user_prompt.startsWith('user_')) {
-          promptType = 'user';
-        } else if (input_user_prompt.startsWith('assistant_')) {
-          promptType = 'assistant';
-        }
-
-        console.log(`Loaded prompt file: ${file}`);
-
-        prompts[input_user_prompt] = {
-          type: promptType,
-          content: promptContent,
-          name: promptType !== 'legacy' ? input_user_prompt.substring(input_user_prompt.indexOf('_') + 1) : input_user_prompt
-        };
+      let promptType = 'legacy';
+      if (input_user_prompt.startsWith('system_')) {
+        promptType = 'system';
+      } else if (input_user_prompt.startsWith('user_')) {
+        promptType = 'user';
+      } else if (input_user_prompt.startsWith('assistant_')) {
+        promptType = 'assistant';
       }
+
+      console.log(`Loaded prompt file: ${file}`);
+
+      prompts[input_user_prompt] = {
+        type: promptType,
+        content: promptContent,
+        name: promptType !== 'legacy' ? input_user_prompt.substring(input_user_prompt.indexOf('_') + 1) : input_user_prompt
+      };
     }
 
     return prompts;
@@ -56,21 +55,20 @@ async function loadData() {
     const dataDir = CONFIGURATION.directories.data;
     const files = await fs.readdir(dataDir);
     const data = Object.create(null);
-    const txtBasenames = [];
+    const textBasenames = [];
+    const claimedText = indexTextFiles(files);
 
     for (const file of files) {
-      if (path.extname(file) !== '.txt') {
-        if (!isImageExtension(file)) {
-          console.log(`Skipping non-txt file: ${file}`);
-        }
-        continue;
+      if (!isTextExtension(file) && !isImageExtension(file)) {
+        console.log(`Skipping non-text file: ${file}`);
       }
+    }
 
-      const name = path.basename(file, '.txt');
+    for (const [name, file] of claimedText) {
       const text = await fs.readFile(path.join(dataDir, file), 'utf8');
       const images = await loadSidecarImages(dataDir, name, files);
-      data[name] = { text, images };
-      txtBasenames.push(name);
+      data[name] = { text, images, textFile: file };
+      textBasenames.push(name);
 
       const sidecarNote = images.length
         ? ` (${images.length} sidecar image${images.length === 1 ? '' : 's'})`
@@ -78,7 +76,7 @@ async function loadData() {
       console.log(`Loaded data file: ${file}${sidecarNote}`);
     }
 
-    for (const imageCase of await loadStandaloneImageCases(dataDir, files, txtBasenames)) {
+    for (const imageCase of await loadStandaloneImageCases(dataDir, files, textBasenames)) {
       data[imageCase.name] = { text: imageCase.text, images: imageCase.images };
       console.log(`Loaded image-only data: ${imageCase.name} (${imageCase.images.map(img => img.filename).join(', ')})`);
     }
@@ -146,7 +144,7 @@ function buildTask(allPrompts, promptContent) {
 function inputFiles(caseName, dataRecord) {
   const files = [];
   if (dataText(dataRecord).trim().length > 0) {
-    files.push(`${caseName}.txt`);
+    files.push(dataRecord.textFile || `${caseName}.txt`);
   }
   for (const image of dataRecord?.images || []) {
     files.push(image.filename);
@@ -194,7 +192,7 @@ function buildUserContent(promptAndDocumentText, dataRecord) {
     { type: 'text', text: `${promptAndDocumentText}\n\nAttached images: ${names}` },
     ...images.map(img => ({
       type: 'image_url',
-      image_url: { url: toDataUrl(img.buffer, img.mime) }
+      image_url: { url: toChatImageUrl(img.buffer, img.mime) }
     }))
   ];
 }
@@ -211,23 +209,23 @@ function isCachingEnabled() {
   return Boolean(CONFIGURATION.performance.caching?.enabled);
 }
 
-async function readCachedResponse(model, prompt, dataRecord) {
+async function readCachedResponse(model, prompt, dataRecord, extras = {}) {
   if (!isCachingEnabled()) {
     return null;
   }
   return getFromCache(
     CONFIGURATION.performance.caching.directory,
-    generateCacheKey(model, prompt, dataRecord)
+    generateCacheKey(model, prompt, dataRecord, extras)
   );
 }
 
-async function writeCachedResponse(model, prompt, dataRecord, response) {
+async function writeCachedResponse(model, prompt, dataRecord, response, extras = {}) {
   if (!isCachingEnabled()) {
     return;
   }
   await saveToCache(
     CONFIGURATION.performance.caching.directory,
-    generateCacheKey(model, prompt, dataRecord),
+    generateCacheKey(model, prompt, dataRecord, extras),
     response
   );
 }
@@ -248,7 +246,13 @@ async function getAvailableModels() {
 
 async function executePrompt(model, prompt, dataRecord, input_user_prompt, allPrompts, options = {}) {
   try {
-    const cachedResponse = await readCachedResponse(model, prompt, dataRecord);
+    const sampleTemperature = options.temperature ?? CONFIGURATION.models.temperature;
+    const cacheExtras = {
+      sampleIndex: options.sampleIndex ?? 0,
+      repeats: options.repeats ?? CONFIGURATION.eval.repeats,
+      temperature: sampleTemperature
+    };
+    const cachedResponse = await readCachedResponse(model, prompt, dataRecord, cacheExtras);
     if (cachedResponse) {
       console.log(`Using cached response for model: ${model}, prompt: ${prompt.name}`);
       return cachedResponse;
@@ -288,7 +292,7 @@ async function executePrompt(model, prompt, dataRecord, input_user_prompt, allPr
     console.log(`Using OpenAIAdapter to connect to ${CONFIGURATION.modelServer.url}`);
 
     const adapterOptions = {
-      temperature: options.temperature || CONFIGURATION.models.temperature,
+      temperature: sampleTemperature,
       max_tokens: options.max_tokens || CONFIGURATION.models.max_tokens,
       top_p: options.top_p || CONFIGURATION.models.top_p,
       schema: useSchema ? schema : null
@@ -348,13 +352,13 @@ async function executePrompt(model, prompt, dataRecord, input_user_prompt, allPr
       console.log('Using chat completion endpoint with messages format');
 
       const data = await modelAdapter.chat(messages, adapterOptions);
-      await writeCachedResponse(model, prompt, dataRecord, data);
+      await writeCachedResponse(model, prompt, dataRecord, data, cacheExtras);
       return data;
     }
 
     console.log('Using legacy completion endpoint (will be converted to chat format)');
     const data = await modelAdapter.execute(buildUserContent(fullPrompt, dataRecord), adapterOptions);
-    await writeCachedResponse(model, prompt, dataRecord, data);
+    await writeCachedResponse(model, prompt, dataRecord, data, cacheExtras);
     return data;
   } catch (error) {
     const errorMessage = error.cause ? error.cause.code : error.message;
@@ -524,9 +528,15 @@ function scoreHeaders(prefix, meta) {
   if (meta.format_valid) {
     headers.push('Format valid');
   }
-  if (meta.fields.length > 0) {
-    headers.push('Hamming', 'Exact match', 'Macro-F1');
+    if (meta.fields.length > 0) {
+    headers.push('Hamming', 'Exact match');
+    if (meta.hasF1) {
+      headers.push('Macro-F1');
+    }
     headers.push(...meta.fields.map(humanizeFieldName));
+  }
+  if (meta.derived_confidence) {
+    headers.push('Confidence (exact)', 'Confidence (Hamming)', 'Brier (exact)', 'Calibration MSE');
   }
   return headers;
 }
@@ -539,15 +549,23 @@ function scoreCells(groupResults, meta) {
   if (meta.fields.length > 0) {
     cells.push(scoreCell(meanHamming(groupResults)));
     cells.push(scoreCell(meanExactMatch(groupResults)));
-    cells.push(scoreCell(macroF1FromResults(groupResults, meta.fields)));
+    if (meta.hasF1) {
+      cells.push(scoreCell(macroF1FromResults(groupResults, meta.fields)));
+    }
     for (const name of meta.fields) {
       cells.push(scoreCell(averageBy(groupResults, result => fieldMatchScore(result.quantitative.fields, name))));
     }
   }
+  if (meta.derived_confidence) {
+    cells.push(scoreCell(averageBy(groupResults, result => result.quantitative?.confidence_exact)));
+    cells.push(scoreCell(averageBy(groupResults, result => result.quantitative?.confidence_hamming)));
+    cells.push(scoreCell(averageBy(groupResults, result => result.quantitative?.brier_exact)));
+    cells.push(scoreCell(averageBy(groupResults, result => result.quantitative?.calibration_mse)));
+  }
   return cells;
 }
 
-function generateReport(results) {
+function generateReport(results, options = {}) {
   const meta = detectReportMeta(results);
   const sample = results[0] || {};
   const task = sample.task || {};
@@ -595,7 +613,11 @@ function generateReport(results) {
   }
 
   report += `## Data\n\n`;
-  report += `- Cases: ${results.length}\n`;
+  const attempted = options.attempted;
+  const caseCount = typeof attempted === 'number' && !Number.isNaN(attempted)
+    ? `${results.length} / ${attempted}`
+    : String(results.length);
+  report += `- Cases: ${caseCount}\n`;
   report += `- Kinds: ${kinds.join(', ') || 'N/A'}\n`;
   if (meta.bucket) {
     report += `- Buckets: ${uniqueValues(results, result => result.quantitative?.bucket).join(', ')}\n`;
@@ -605,9 +627,13 @@ function generateReport(results) {
   report += `## Headline\n\n`;
   report += `- Hamming accuracy: ${scoreCell(meanHamming(results))}\n`;
   report += `- Exact match: ${scoreCell(meanExactMatch(results))}\n`;
-  report += `- Macro-F1: ${scoreCell(macroF1FromResults(results, meta.fields))}\n`;
-  report += `- Brier: ${scoreCell(averageBy(results, result => result.quantitative?.brier))}\n`;
-  report += `- Stated confidence: ${scoreCell(averageBy(results, result => result.quantitative?.stated_confidence))}\n`;
+  if (meta.hasF1) {
+    report += `- Macro-F1: ${scoreCell(macroF1FromResults(results, meta.fields))}\n`;
+  }
+  report += `- Brier (exact): ${scoreCell(averageBy(results, result => result.quantitative?.brier_exact))}\n`;
+  report += `- Calibration MSE: ${scoreCell(averageBy(results, result => result.quantitative?.calibration_mse))}\n`;
+  report += `- Confidence (exact): ${scoreCell(averageBy(results, result => result.quantitative?.confidence_exact))}\n`;
+  report += `- Confidence (Hamming): ${scoreCell(averageBy(results, result => result.quantitative?.confidence_hamming))}\n`;
   if (meta.format_valid) {
     report += `- Format valid: ${scoreCell(averageBy(results, result => result.quantitative.format_valid))}\n`;
   }
@@ -639,9 +665,10 @@ function generateReport(results) {
 
   if (meta.fields.length > 0) {
     report += `\n## By field\n\n`;
+    const fieldRows = perFieldClassification(results, meta.fields);
     report += markdownTable(
       ['Field', 'Precision', 'Recall', 'F1', 'Accuracy'],
-      perFieldClassification(results, meta.fields).map(row => [
+      fieldRows.map(row => [
         humanizeFieldName(row.name),
         scoreCell(row.precision),
         scoreCell(row.recall),
@@ -674,7 +701,7 @@ function generateReport(results) {
   report += `\n## Files\n\n`;
   report += `- \`report.md\` — this file\n`;
   report += `- \`results.csv\` — all cases, one row each (\`gold_*\` / \`pred_*\` / \`correct_*\`)\n`;
-  report += `- \`metrics.csv\` — one row per model plus \`all\` (Hamming, exact match, macro-F1, Brier)\n`;
+  report += `- \`metrics.csv\` — one row per model plus \`all\` (Hamming, exact match, macro-F1, per-field P/R/F1/accuracy, consistency confidence, Brier exact, calibration MSE)\n`;
   report += `- \`results.json\` — full records including model JSON\n`;
   return report;
 }
@@ -745,8 +772,10 @@ ${fence(JSON.stringify(result.response, null, 2))}
 - Format valid: ${q.format_valid !== undefined ? (q.format_valid === 1 ? 'yes' : 'no') : 'N/A'}
 - Hamming accuracy: ${typeof q.hamming_accuracy === 'number' ? q.hamming_accuracy.toFixed(2) : 'N/A'}
 - Exact match: ${typeof q.exact_match === 'number' ? q.exact_match.toFixed(2) : 'N/A'}
-- Stated confidence: ${typeof q.stated_confidence === 'number' ? q.stated_confidence.toFixed(2) : 'N/A'}
-- Brier: ${typeof q.brier === 'number' ? q.brier.toFixed(2) : 'N/A'}
+- Confidence (exact): ${typeof q.confidence_exact === 'number' ? q.confidence_exact.toFixed(2) : 'N/A'}
+- Confidence (Hamming): ${typeof q.confidence_hamming === 'number' ? q.confidence_hamming.toFixed(2) : 'N/A'}
+- Brier (exact): ${typeof q.brier_exact === 'number' ? q.brier_exact.toFixed(2) : 'N/A'}
+- Calibration MSE: ${typeof q.calibration_mse === 'number' ? q.calibration_mse.toFixed(2) : 'N/A'}
 ${q.bucket ? `- Bucket: ${q.bucket}\n` : ''}
 ${notes ? `## Notes\n\n${notes}\n` : ''}
 ## Timestamp
@@ -767,7 +796,7 @@ ${result.timestamp}
   }
 }
 
-async function saveResults(results) {
+async function saveResults(results, options = {}) {
   try {
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const runDir = path.join(CONFIGURATION.directories.results, `run_${timestamp}`);
@@ -780,7 +809,7 @@ async function saveResults(results) {
     console.log(`Results saved to ${jsonPath}`);
 
     const reportPath = path.join(runDir, 'report.md');
-    await fs.writeFile(reportPath, generateReport(results));
+    await fs.writeFile(reportPath, generateReport(results, options));
     console.log(`Report saved to ${reportPath}`);
 
     const collectiveCsvPath = path.join(runDir, 'results.csv');
@@ -878,16 +907,30 @@ async function runTests() {
       const testStartTime = Date.now();
 
       try {
-        console.log(`Executing prompt...`);
-        const response = await executePrompt(model, promptContent, documentContent, input_user_prompt, prompts);
-        
-        console.log(`Parsing response...`);
-        const parsedResponse = await parseJsonFromResponse(response);
-        
-        console.log(`Evaluating response...`);
+        const repeats = CONFIGURATION.eval.repeats;
+        const sampleTemperature = CONFIGURATION.models.temperature;
+        const samples = [];
+        for (let sampleIndex = 0; sampleIndex < repeats; sampleIndex += 1) {
+          console.log(`\n  SAMPLE ${sampleIndex + 1}/${repeats}  T=${sampleTemperature}`);
+          console.log(`  ${'-'.repeat(40)}`);
+          const response = await executePrompt(model, promptContent, documentContent, input_user_prompt, prompts, {
+            sampleIndex,
+            repeats,
+            temperature: sampleTemperature
+          });
+          const parsed = await parseJsonFromResponse(response);
+          samples.push(parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null);
+        }
+
+        const voted = selfConsistency(samples, loadFieldNames());
+        const parsedResponse = voted.prediction;
+
+        console.log(`Evaluating majority vote (${repeats} samples)...`);
         const evaluation = await evaluateResponse(parsedResponse, {
           ...evaluationOptions,
           input_data_file,
+          confidence_exact: voted.confidence_exact,
+          confidence_hamming: voted.confidence_hamming
         });
 
         if (!evaluation) {
@@ -908,6 +951,18 @@ async function runTests() {
         console.log(`Scores:`);
         console.log(`  - Hamming accuracy: ${scoreCell(quantitative.hamming_accuracy)}`);
         console.log(`  - Exact match: ${scoreCell(quantitative.exact_match)}`);
+        if (quantitative.confidence_exact !== undefined && quantitative.confidence_exact !== null) {
+          console.log(`  - Confidence (exact): ${scoreCell(quantitative.confidence_exact)}`);
+        }
+        if (quantitative.confidence_hamming !== undefined && quantitative.confidence_hamming !== null) {
+          console.log(`  - Confidence (Hamming): ${scoreCell(quantitative.confidence_hamming)}`);
+        }
+        if (quantitative.brier_exact !== undefined && quantitative.brier_exact !== null) {
+          console.log(`  - Brier (exact): ${scoreCell(quantitative.brier_exact)}`);
+        }
+        if (quantitative.calibration_mse !== undefined && quantitative.calibration_mse !== null) {
+          console.log(`  - Calibration MSE: ${scoreCell(quantitative.calibration_mse)}`);
+        }
         if (quantitative.format_valid !== undefined) {
           console.log(`  - Format valid: ${scoreCell(quantitative.format_valid)}`);
           if (quantitative.bucket) {
@@ -1085,16 +1140,17 @@ async function runTests() {
 
     results.push(...allResults.filter(result => result !== null));
 
+    const totalTests = testCases.length;
+    const successfulTests = results.length;
+    const failedTests = totalTests - successfulTests;
+
     if (results.length > 0) {
-      const saveInfo = await saveResults(results);
+      const saveInfo = await saveResults(results, { attempted: totalTests });
       
       console.log(`\n${'='.repeat(60)}`);
       console.log(`TEST EXECUTION SUMMARY`);
       console.log(`${'='.repeat(60)}`);
       
-      const totalTests = testCases.length;
-      const successfulTests = results.length;
-      const failedTests = totalTests - successfulTests;
       const fieldNames = resolveFieldNames(results);
       const hamming = meanHamming(results);
       const exact = meanExactMatch(results);
@@ -1106,12 +1162,16 @@ async function runTests() {
       console.log(`  - Successful: ${successfulTests} (${Math.round(successfulTests/totalTests*100)}%)`);
       console.log(`  - Failed: ${failedTests} (${Math.round(failedTests/totalTests*100)}%)`);
 
-      console.log(`\nAverage scores:`);
+      console.log(`\nAverage scores (${successfulTests} scored / ${totalTests} attempted):`);
       console.log(`  - Hamming accuracy: ${scoreCell(hamming)}`);
       console.log(`  - Exact match: ${scoreCell(exact)}`);
-      console.log(`  - Macro-F1: ${scoreCell(macroF1)}`);
-      console.log(`  - Brier: ${scoreCell(averageBy(results, result => result.quantitative?.brier))}`);
-      console.log(`  - Stated confidence: ${scoreCell(averageBy(results, result => result.quantitative?.stated_confidence))}`);
+      if (macroF1 !== null) {
+        console.log(`  - Macro-F1: ${scoreCell(macroF1)}`);
+      }
+      console.log(`  - Brier (exact): ${scoreCell(averageBy(results, result => result.quantitative?.brier_exact))}`);
+      console.log(`  - Calibration MSE: ${scoreCell(averageBy(results, result => result.quantitative?.calibration_mse))}`);
+      console.log(`  - Confidence (exact): ${scoreCell(averageBy(results, result => result.quantitative?.confidence_exact))}`);
+      console.log(`  - Confidence (Hamming): ${scoreCell(averageBy(results, result => result.quantitative?.confidence_hamming))}`);
       if (detectReportMeta(results).format_valid) {
         console.log(`  - Format valid: ${scoreCell(formatValid)}`);
       }
@@ -1138,7 +1198,11 @@ async function runTests() {
             hamming_accuracy: hamming,
             exact_match: exact,
             macro_f1: macroF1,
-            format_valid: formatValid
+            format_valid: formatValid,
+            brier_exact: averageBy(results, result => result.quantitative?.brier_exact),
+            calibration_mse: averageBy(results, result => result.quantitative?.calibration_mse),
+            confidence_exact: averageBy(results, result => result.quantitative?.confidence_exact),
+            confidence_hamming: averageBy(results, result => result.quantitative?.confidence_hamming)
           }
         };
         

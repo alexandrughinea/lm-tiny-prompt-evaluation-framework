@@ -104,6 +104,55 @@ export function toDataUrl(buffer, mime) {
   return `data:${mime};base64,${buffer.toString('base64')}`;
 }
 
+const LMS_PREFIX_AS_PNG = new Set(['image/webp', 'image/gif']);
+
+/**
+ * Chat image URL for local OpenAI-compatible servers.
+ * WebP/GIF keep their bytes but declare png — LM Studio rejects those prefixes.
+ *
+ * @param {Buffer} buffer
+ * @param {string} mime
+ * @returns {string}
+ */
+export function toChatImageUrl(buffer, mime) {
+  const declared = LMS_PREFIX_AS_PNG.has(mime) ? 'image/png' : mime;
+  return toDataUrl(buffer, declared);
+}
+
+const DATA_URI = /^data:image\/[a-zA-Z0-9.+-]+;base64,(.+)$/;
+
+export function toRawBase64Url(url) {
+  const text = String(url ?? '');
+  const match = text.match(DATA_URI);
+  return match ? match[1] : text;
+}
+
+export function rewriteMessageImageUrls(messages, rewriteUrl) {
+  if (!Array.isArray(messages)) {
+    return messages;
+  }
+  return messages.map(message => {
+    if (!Array.isArray(message?.content)) {
+      return message;
+    }
+    return {
+      ...message,
+      content: message.content.map(part => {
+        if (part?.type !== 'image_url' || !part.image_url) {
+          return part;
+        }
+        return {
+          ...part,
+          image_url: {
+            ...part.image_url,
+            url: rewriteUrl(part.image_url.url)
+          }
+        };
+      })
+    };
+  });
+}
+
 /**
  * Load same-basename images, verified by magic bytes.
  *
@@ -158,7 +207,7 @@ export async function loadSidecarImages(dataDir, basename, files) {
 }
 
 /**
- * Load image-only test cases: images with no matching .txt, grouped by basename.
+ * Load image-only test cases: images with no matching .txt/.md, grouped by basename.
  *
  * @param {string} dataDir
  * @param {string[]} files

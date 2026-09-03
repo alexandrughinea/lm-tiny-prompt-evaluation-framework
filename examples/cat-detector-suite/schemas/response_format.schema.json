@@ -6,8 +6,7 @@
     "domestic_cat",
     "person",
     "wildlife_felid",
-    "contains_manmade_object",
-    "stated_confidence"
+    "contains_manmade_object"
   ],
   "properties": {
     "domestic_cat": {
@@ -25,12 +24,6 @@
     "contains_manmade_object": {
       "type": "boolean",
       "description": "True if a built or manufactured object is visible."
-    },
-    "stated_confidence": {
-      "type": "number",
-      "minimum": 0,
-      "maximum": 1,
-      "description": "Model self-assessment of how sure it is that the four flags are correct (0–1). Not a harness score; gold labels omit this key."
     }
   }
 }

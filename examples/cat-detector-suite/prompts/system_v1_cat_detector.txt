@@ -5,7 +5,6 @@ Return a single JSON object, nothing else. Use exactly these keys:
 - person (boolean): true if at least one human is visible
 - wildlife_felid (boolean): true if a wild felid is visible (lion, tiger, leopard, cheetah, and similar). Cat-face flowers and dogs are false. Must not be true when domestic_cat is true.
 - contains_manmade_object (boolean): true if a built or manufactured thing is visible: furniture, vehicles, dishes, signs, textiles, electronics, buildings, walls, fences, toys. Not man-made: sky, grass, trees, dirt, straw, water, unworked stone, plants, animals, or a seamless studio backdrop used only as background.
-- stated_confidence (number 0.0 to 1.0): your self-assessment of how sure you are that the four flags are correct. This is not a score from an evaluator.
 
 Examples:
 - Domestic cat on a stucco ledge → domestic_cat true, person false, wildlife_felid false, contains_manmade_object true
