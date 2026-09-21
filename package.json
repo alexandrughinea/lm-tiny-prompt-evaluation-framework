@@ -8,8 +8,25 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node src/framework.js",
-    "test-connection": "node utils/test-connection.js"
+    "start": "node src/framework.js",
+    "start:connection": "node utils/test-connection.js",
+    "aggregate-gold": "node scripts/aggregate-gold.js",
+    "sample-size": "node scripts/sample-size.js",
+    "qc": "node scripts/qc-production.js",
+    "export-sft": "node scripts/export-sft.js",
+    "test": "node --test utils/*.test.js scripts/*.test.js src/*.test.js src/adapters/*.test.js",
+    "test:aggregate-gold": "node --test scripts/aggregate-gold.test.js",
+    "test:sample-size": "node --test scripts/sample-size.test.js",
+    "test:qc": "node --test scripts/qc-production.test.js",
+    "test:stats": "node --test utils/stats.test.js",
+    "test:sft-formats": "node --test utils/sft-formats.test.js",
+    "test:export-sft": "node --test scripts/export-sft.test.js",
+    "test:text-files": "node --test utils/text-files.test.js",
+    "test:label-normalize": "node --test utils/label-normalize.test.js",
+    "test:report-utils": "node --test utils/report-utils.test.js",
+    "test:suite-resolve": "node --test utils/suite-resolve.test.js",
+    "test:media-utils": "node --test utils/media-utils.test.js",
+    "test:openai-adapter": "node --test src/adapters/openai.test.js"
   },
   "keywords": [
     "llm",
@@ -20,7 +37,9 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@inquirer/prompts": "^8.6.0",
     "axios": "^1.19.0",
+    "csv-parse": "^7.0.2",
     "dotenv": "^16.6.1"
   }
 }

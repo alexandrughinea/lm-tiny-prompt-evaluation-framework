@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { CONFIGURATION } from '../config.js';
+import { rewriteMessageImageUrls, toRawBase64Url } from '../../utils/media-utils.js';
 
 export default class OpenAIAdapter {
   constructor(config = {}) {
@@ -66,7 +67,7 @@ export default class OpenAIAdapter {
     const requestBody = {
       model: modelToUse,
       messages,
-      temperature: options.temperature || this.temperature,
+      temperature: options.temperature ?? this.temperature,
       max_tokens: safeMaxTokens,
       top_p: options.top_p || 0.95,
     };
@@ -83,54 +84,69 @@ export default class OpenAIAdapter {
     }
     
     console.log(`Request timeout set to ${this.timeout}ms`);
-    
+
+    const headers = {
+      'Content-Type': 'application/json',
+    };
+    if (this.authHeader) {
+      headers['Authorization'] = this.authHeader;
+    }
+
+    const post = (body) => axios({
+      method: 'post',
+      url: endpoint,
+      data: body,
+      headers,
+      timeout: this.timeout,
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity
+    });
+
     try {
       const startTime = Date.now();
-      
-      const headers = {
-        'Content-Type': 'application/json',
-      };
-      
-      if (this.authHeader) {
-        headers['Authorization'] = this.authHeader;
+      let response;
+      try {
+        response = await post(requestBody);
+      } catch (error) {
+        if (
+          isLmStudioImageUrlError(error) &&
+          messagesHaveImageUrls(messages)
+        ) {
+          console.warn('LM Studio rejected data URIs; retrying with raw base64 image urls');
+          response = await post({
+            ...requestBody,
+            messages: rewriteMessageImageUrls(messages, toRawBase64Url)
+          });
+        } else {
+          throw error;
+        }
       }
-      
-      const response = await axios({
-        method: 'post',
-        url: endpoint,
-        data: requestBody,
-        headers,
-        timeout: this.timeout,
-        maxContentLength: Infinity,
-        maxBodyLength: Infinity
-      });
-      
+
       const endTime = Date.now();
       const completionTime = endTime - startTime;
-      
       const responseData = response.data;
-      
+
       if (responseData.choices && responseData.choices[0] && responseData.choices[0].message) {
         const contentLength = responseData.choices[0].message.content?.length || 0;
         console.log(`Response content length: ${contentLength} characters`);
-        
+
         if (contentLength > 0 && responseData.choices[0].finish_reason === 'length') {
           console.warn('Warning: Response may be truncated (finish_reason=length)');
         }
       }
-      
+
       if (!responseData.usage) {
         responseData.usage = {
           completion_ms: completionTime || 0
         };
       }
-      
+
       return responseData;
     } catch (error) {
       if (error.code === 'ECONNABORTED') {
         throw new Error(`Request timed out after ${this.timeout}ms`);
       }
-      
+
       if (error.response) {
         console.error('Error response data:', error.response.data);
         console.error('Error response status:', error.response.status);
@@ -179,6 +195,22 @@ export default class OpenAIAdapter {
       }
     }
   }
+}
+
+export function isLmStudioImageUrlError(error) {
+  const data = error?.response?.data ?? error?.message ?? error;
+  const text = typeof data === 'string' ? data : JSON.stringify(data ?? '');
+  return /url['’]? field must be a base64 encoded image/i.test(text);
+}
+
+export function messagesHaveImageUrls(messages) {
+  if (!Array.isArray(messages)) {
+    return false;
+  }
+  return messages.some(message =>
+    Array.isArray(message?.content) &&
+    message.content.some(part => part?.type === 'image_url')
+  );
 }
 
 /**

@@ -213,6 +213,10 @@ export async function sendErrorToSlack(context = {}, error) {
  * @param {number} [summary.averageScores.exact_match] - Exact match rate
  * @param {number} [summary.averageScores.macro_f1] - Label-macro F1
  * @param {number} [summary.averageScores.format_valid] - Format validity rate
+ * @param {number} [summary.averageScores.brier_exact] - Mean Brier vs exact match
+ * @param {number} [summary.averageScores.calibration_mse] - Mean (confidence_hamming − Hamming)²
+ * @param {number} [summary.averageScores.confidence_exact] - Self-consistency vote share of the majority JSON
+ * @param {number} [summary.averageScores.confidence_hamming] - Mean per-field majority vote share
  * @param {string} csvContent - CSV content to include in the message
  * @returns {Promise<void>}
  */
@@ -307,13 +311,31 @@ export async function sendTestResultsToSlack(summary, csvContent) {
             type: "mrkdwn",
             text: scoreField('Exact match', summary.averageScores.exact_match)
           },
-          {
-            type: "mrkdwn",
-            text: scoreField('Macro-F1', summary.averageScores.macro_f1)
-          },
+          ...(typeof summary.averageScores.macro_f1 === 'number' && !Number.isNaN(summary.averageScores.macro_f1)
+            ? [{
+              type: "mrkdwn",
+              text: scoreField('Macro-F1', summary.averageScores.macro_f1)
+            }]
+            : []),
           {
             type: "mrkdwn",
             text: scoreField('Format valid', summary.averageScores.format_valid)
+          },
+          {
+            type: "mrkdwn",
+            text: scoreField('Brier (exact)', summary.averageScores.brier_exact)
+          },
+          {
+            type: "mrkdwn",
+            text: scoreField('Calibration MSE', summary.averageScores.calibration_mse)
+          },
+          {
+            type: "mrkdwn",
+            text: scoreField('Confidence (exact)', summary.averageScores.confidence_exact)
+          },
+          {
+            type: "mrkdwn",
+            text: scoreField('Confidence (Hamming)', summary.averageScores.confidence_hamming)
           }
         ]
       }

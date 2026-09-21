@@ -10,9 +10,10 @@ import { ensureDir } from './file-utils.js';
  * @param {string} model - The model ID
  * @param {Object} prompt - The prompt object
  * @param {string|{text?: string, images?: Array<{filename: string, mime: string, buffer: Buffer}>}} data
+ * @param {Object} [extras] - Cache namespace (sample index, temperature, N)
  * @returns {string} - A unique hash for this combination
  */
-export function generateCacheKey(model, prompt, data) {
+export function generateCacheKey(model, prompt, data, extras = {}) {
   const text = typeof data === 'string' ? data : (data?.text || '');
   const images = Array.isArray(data?.images)
     ? data.images.map(img => ({
@@ -28,7 +29,8 @@ export function generateCacheKey(model, prompt, data) {
     promptName: prompt.name,
     promptContent: prompt.content,
     text,
-    images
+    images,
+    extras
   })).digest('hex');
 }
 

@@ -1,0 +1,6 @@
+{
+  "model": {
+    "temperature": 0,
+    "structured_output": false
+  }
+}

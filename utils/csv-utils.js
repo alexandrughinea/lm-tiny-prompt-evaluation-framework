@@ -19,6 +19,8 @@ const BASE_COLUMNS = [
     'experiment',
     'model',
     'prompt_name',
+    'input_system_prompt',
+    'input_user_prompt',
     'input_data_file',
     'input_kind',
     'bucket',
@@ -28,8 +30,10 @@ const BASE_COLUMNS = [
 const TAIL_COLUMNS = [
     'hamming_accuracy',
     'exact_match',
-    'stated_confidence',
-    'brier',
+    'confidence_exact',
+    'confidence_hamming',
+    'brier_exact',
+    'calibration_mse',
     'miss_count',
     'processing_time'
 ];
@@ -115,6 +119,8 @@ export function getCSVDataMap({
     model,
     prompt_name,
     task,
+    input_system_prompt,
+    input_user_prompt,
     input_data_file,
     input_kind,
     quantitative,
@@ -134,6 +140,8 @@ export function getCSVDataMap({
         experiment: task?.experiment || '',
         model: model || '',
         prompt_name: task?.prompt_name || prompt_name || '',
+        input_system_prompt: input_system_prompt || '',
+        input_user_prompt: input_user_prompt || '',
         input_data_file: input_data_file || '',
         input_kind: input_kind || '',
         bucket: quantitative?.bucket || '',
@@ -141,8 +149,10 @@ export function getCSVDataMap({
         ...fieldCells,
         hamming_accuracy: formatScore(quantitative?.hamming_accuracy),
         exact_match: formatBit(quantitative?.exact_match),
-        stated_confidence: formatScore(quantitative?.stated_confidence),
-        brier: formatScore(quantitative?.brier),
+        confidence_exact: formatScore(quantitative?.confidence_exact),
+        confidence_hamming: formatScore(quantitative?.confidence_hamming),
+        brier_exact: formatScore(quantitative?.brier_exact),
+        calibration_mse: formatScore(quantitative?.calibration_mse),
         miss_count: fieldMissCount(fields),
         processing_time: typeof processing_time === 'number' ? String(processing_time) : ''
     };
@@ -153,22 +163,30 @@ export function getCSVColumnsJoined(fieldNames = []) {
 }
 
 export function getMetricsColumns(fieldNames = []) {
-    return [
+    const columns = [
         'experiment',
         'model',
         'n',
         'format_valid_rate',
         'hamming_accuracy',
-        'exact_match',
-        'macro_f1',
-        'mean_stated_confidence',
-        'brier',
+        'exact_match'
+    ];
+    if (fieldNames.length > 0) {
+        columns.push('macro_f1');
+    }
+    columns.push(
+        'mean_confidence_exact',
+        'mean_confidence_hamming',
+        'brier_exact',
+        'calibration_mse',
         ...fieldNames.flatMap(name => [
             `precision_${name}`,
             `recall_${name}`,
-            `f1_${name}`
+            `f1_${name}`,
+            `accuracy_${name}`
         ])
-    ];
+    );
+    return columns;
 }
 
 function metricsRow(experiment, model, group, fieldNames) {
@@ -177,6 +195,7 @@ function metricsRow(experiment, model, group, fieldNames) {
         extra[`precision_${row.name}`] = formatScore(row.precision);
         extra[`recall_${row.name}`] = formatScore(row.recall);
         extra[`f1_${row.name}`] = formatScore(row.f1);
+        extra[`accuracy_${row.name}`] = formatScore(row.accuracy);
     }
 
     return {
@@ -187,8 +206,10 @@ function metricsRow(experiment, model, group, fieldNames) {
         hamming_accuracy: formatScore(meanBy(group, result => result.quantitative?.hamming_accuracy)),
         exact_match: formatScore(meanBy(group, result => result.quantitative?.exact_match)),
         macro_f1: formatScore(macroF1FromResults(group, fieldNames)),
-        mean_stated_confidence: formatScore(meanBy(group, result => result.quantitative?.stated_confidence)),
-        brier: formatScore(meanBy(group, result => result.quantitative?.brier)),
+        mean_confidence_exact: formatScore(meanBy(group, result => result.quantitative?.confidence_exact)),
+        mean_confidence_hamming: formatScore(meanBy(group, result => result.quantitative?.confidence_hamming)),
+        brier_exact: formatScore(meanBy(group, result => result.quantitative?.brier_exact)),
+        calibration_mse: formatScore(meanBy(group, result => result.quantitative?.calibration_mse)),
         ...extra
     };
 }

@@ -8,11 +8,11 @@ Image-only **scene audit**: domestic cat, person, wild felid, man-made object. S
 INPUT_EXPERIMENT=cat-detector-suite
 ```
 
-Suite settings live in `config.json` (temperature, structured output). Gold labels are in `labels/`, never in `data/`.
+Suite settings live in `config.json` (`model` decode + `eval.repeats`). Gold labels are in `labels/`, never in `data/`.
 
 ## Fields
 
-Gold and model JSON. Model JSON also includes `stated_confidence`: the **model’s self-assessment** (how sure it is), not a harness metric. Gold files omit it. The harness copies it into `results.csv` and scores it with **Brier** against exact match.
+Gold and model JSON. The model does not emit a confidence number. The harness samples `eval.repeats` times at `model.temperature` (see `config.json`), majority-votes the scored fields, and writes **`confidence_exact`** / **`confidence_hamming`**. Hamming itself stays a column.
 
 - `domestic_cat` — domestic cat (*Felis catus*), including photos, drawings, sculptures, stuffed animals. Lions, tigers, cat-shaped plants or food are false.
 - `person` — at least one human
@@ -32,7 +32,7 @@ Each image has one primary `bucket` in its label file (report breakdowns only, n
 
 ## Layout
 
-- `config.json` — temperature, schema, token cap
+- `config.json` — `model` (temperature, tokens, structured output) and `eval.repeats`
 - `report.json` — field column order
 - `prompts/` — paired `system_v1_cat_detector.txt` and `user_v1_cat_detector.txt`
 - `schemas/response_format.schema.json` — model output shape
@@ -40,17 +40,18 @@ Each image has one primary `bucket` in its label file (report breakdowns only, n
 - `labels/{basename}.json` — gold booleans and `bucket`
 - `evaluators/` — schema validity plus predicted vs gold fields
 
-Do not add a same-basename `.txt` next to an image. Do not put labels in `data/`.
+Do not add a same-basename `.txt` or `.md` next to an image. Do not put labels in `data/`.
 
-Suite evaluators must export `evaluateQuantitative` and `evaluateQualitative` as in the root README. This suite returns `fields`, `format_valid`, `bucket`, and `errors`. Hamming / exact match / macro-F1 / Brier are added by the harness.
+Suite evaluators must export `evaluateQuantitative` and `evaluateQualitative` as in the root README. This suite returns `fields`, `format_valid`, `bucket`, and `errors`. Hamming / exact match / macro-F1 / brier_exact / calibration_mse are added by the harness.
 
 ## Scores
 
 - **Format valid** — 1 if JSON keys/types pass and `domestic_cat` and `wildlife_felid` are not both true
-- **Hamming accuracy** — mean field match (correct labels / 4)
+- **Hamming accuracy** — mean field match (correct labels / 4). First-class column; not replaced by calibration MSE.
 - **Exact match** — 1 only if every field matches gold
-- **Macro-F1** — unweighted mean of per-label F1 over the run (sklearn `average="macro"`, `zero_division=0`)
-- **Brier** — harness score of that self-assessment: `(stated_confidence − exact_match)²`. Empty if the model omitted `stated_confidence`.
+- **Macro-F1** — unweighted mean of per-field F1 over the run (sklearn `average="macro"`, `zero_division=0`). Boolean flags keep positive-class F1; string suites use the same headline via class-macro F1 over enum tokens.
+- **Brier (exact)** — classical binary Brier: `(confidence_exact − exact_match)²`. Empty on QC (no samples).
+- **Calibration MSE** — `(confidence_hamming − Hamming)²` on that case (not Brier 1950). Empty on QC.
 - **Fields** — `gold_*` / `pred_*` / `correct_*` as `0`/`1` in `results.csv`
 
 Use a vision-capable model in `DEFAULT_MODELS`.

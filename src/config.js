@@ -2,6 +2,7 @@ import fs from 'fs';
 import dotenv from 'dotenv';
 import path from 'path';
 import {fileURLToPath} from 'url';
+import { resolveExperiment, resolveInputDir } from '../utils/suite-resolve.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -35,49 +36,8 @@ function readJsonIfPresent(filePath) {
   }
 }
 
-function listSuiteNames(dir) {
-  try {
-    return fs.readdirSync(dir, { withFileTypes: true })
-      .filter(entry => entry.isDirectory())
-      .map(entry => entry.name);
-  } catch {
-    return [];
-  }
-}
-
-function experimentName() {
-  return (process.env.INPUT_EXPERIMENT || process.env.EXPERIMENT || DEFAULT_EXPERIMENT).trim();
-}
-
-function isSuiteDir(dir) {
-  return fs.existsSync(dir) && fs.statSync(dir).isDirectory();
-}
-
-function experimentRoot() {
-  const name = experimentName();
-  const bundled = path.resolve(EXAMPLES_ROOT, name);
-  if (isSuiteDir(bundled)) {
-    return bundled;
-  }
-  const local = path.resolve(INPUT_ROOT, name);
-  if (isSuiteDir(local)) {
-    return local;
-  }
-
-  const examples = listSuiteNames(EXAMPLES_ROOT);
-  const inputs = listSuiteNames(INPUT_ROOT);
-  const hint = [
-    examples.length ? `examples: ${examples.join(', ')}` : '',
-    inputs.length ? `inputs: ${inputs.join(', ')}` : ''
-  ].filter(Boolean).join('; ');
-  throw new Error(
-    `Suite "${name}" not found under inputs/ or examples/. Set INPUT_EXPERIMENT to a suite folder name.` +
-    (hint ? ` Available (${hint}).` : '')
-  );
-}
-
-function loadExperimentConfig(root) {
-  const parsed = readJsonIfPresent(path.join(root, 'config.json'));
+function loadExperimentConfig(suiteRoot) {
+  const parsed = readJsonIfPresent(path.join(suiteRoot, 'config.json'));
   return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
 }
 
@@ -91,9 +51,55 @@ function configOrEnv(configValue, envValue, fallback) {
   return fallback;
 }
 
-const root = experimentRoot();
+function asObject(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+export function readSuiteSettings(experiment = {}, env = {}) {
+  const model = asObject(experiment.model);
+  const evalBlock = asObject(experiment.eval);
+  const temperature = parseFloat(configOrEnv(
+    model.temperature ?? experiment.temperature,
+    env.TEMPERATURE,
+    DEFAULTS.models.temperature
+  ));
+  const top_p = parseFloat(configOrEnv(
+    model.top_p ?? experiment.top_p,
+    env.TOP_P,
+    DEFAULTS.models.top_p
+  ));
+  const max_tokens = parseInt(
+    configOrEnv(model.max_tokens ?? experiment.max_tokens, env.MAX_TOKENS, DEFAULTS.models.max_tokens),
+    10
+  );
+  const structuredOutput = String(configOrEnv(
+    model.structured_output ?? experiment.use_structured_output,
+    env.USE_STRUCTURED_OUTPUT_SCHEMA,
+    true
+  )) === 'true';
+  const evalRepeats = Math.max(1, parseInt(
+    configOrEnv(evalBlock.repeats ?? experiment.consistency_n, env.CONSISTENCY_N, 3),
+    10
+  ) || 3);
+
+  return {
+    temperature,
+    top_p,
+    max_tokens,
+    structuredOutput,
+    evalRepeats
+  };
+}
+
+const { name, root } = resolveExperiment({
+  env: process.env,
+  projectRoot: PROJECT_ROOT,
+  examplesRoot: EXAMPLES_ROOT,
+  inputsRoot: INPUT_ROOT,
+  defaultExperiment: DEFAULT_EXPERIMENT
+});
 const experiment = loadExperimentConfig(root);
-const name = experimentName() || path.basename(root);
+const suiteSettings = readSuiteSettings(experiment, process.env);
 
 function resolveModels() {
   if (Array.isArray(experiment.models) && experiment.models.length > 0) {
@@ -105,6 +111,10 @@ function resolveModels() {
   return DEFAULTS.models.default;
 }
 
+function dirFromEnv(envKey, fallback) {
+  return resolveInputDir(process.env, envKey, PROJECT_ROOT, fallback);
+}
+
 export const CONFIGURATION = {
   experiment: name,
   modelServer: {
@@ -112,29 +122,23 @@ export const CONFIGURATION = {
   },
   models: {
     default: resolveModels(),
-    max_tokens: parseInt(
-      configOrEnv(experiment.max_tokens, process.env.MAX_TOKENS, DEFAULTS.models.max_tokens),
-      10
-    ),
-    temperature: parseFloat(
-      configOrEnv(experiment.temperature, process.env.TEMPERATURE, DEFAULTS.models.temperature)
-    ),
-    top_p: parseFloat(
-      configOrEnv(experiment.top_p, process.env.TOP_P, DEFAULTS.models.top_p)
-    ),
+    max_tokens: suiteSettings.max_tokens,
+    temperature: suiteSettings.temperature,
+    top_p: suiteSettings.top_p
   },
-  structuredOutput: String(configOrEnv(
-    experiment.use_structured_output,
-    process.env.USE_STRUCTURED_OUTPUT_SCHEMA,
-    true
-  )) === 'true',
+  eval: {
+    repeats: suiteSettings.evalRepeats
+  },
+  structuredOutput: suiteSettings.structuredOutput,
   directories: {
     root,
-    prompts: path.join(root, 'prompts'),
-    data: path.join(root, 'data'),
-    labels: path.join(root, 'labels'),
-    schemas: path.join(root, 'schemas'),
-    evaluators: path.join(root, 'evaluators'),
+    prompts: dirFromEnv('INPUT_PROMPTS_DIR', path.join(root, 'prompts')),
+    data: dirFromEnv('INPUT_DATA_DIR', path.join(root, 'data')),
+    labels: dirFromEnv('INPUT_LABELS_DIR', path.join(root, 'labels')),
+    annotations: dirFromEnv('INPUT_ANNOTATIONS_DIR', path.join(root, 'annotations')),
+    reviews: path.join(root, 'reviews'),
+    schemas: dirFromEnv('INPUT_SCHEMAS_DIR', path.join(root, 'schemas')),
+    evaluators: dirFromEnv('INPUT_EVALUATORS_DIR', path.join(root, 'evaluators')),
     results: process.env.RESULTS_DIR
       ? path.resolve(process.env.RESULTS_DIR)
       : path.join(PROJECT_ROOT, 'results', name),
